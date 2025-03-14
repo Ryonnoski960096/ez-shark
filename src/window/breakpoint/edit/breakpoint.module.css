@@ -1,0 +1,42 @@
+.breakpoint {
+  width: 100%;
+}
+
+.formContainer {
+  width: 100%;
+  min-width: 300px;
+  overflow-x: auto;
+}
+
+.customForm {
+  width: 100%;
+}
+
+.formTable {
+  width: 100%;
+  table-layout: fixed;
+}
+
+.formRow {
+  height: 32px;
+}
+
+.labelCell {
+  width: 120px;
+  padding-right: 8px;
+  text-align: right;
+  font-size: 13px;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.controlCell {
+  width: 200px;
+  padding: 4px 0;
+  vertical-align: middle;
+}
+.formActions {
+  display: flex;
+  justify-content: center;
+  /* margin-top: 20px; */
+}
