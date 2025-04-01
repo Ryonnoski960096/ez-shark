@@ -24,8 +24,6 @@ windowInit();
 
 const settingStore = useSettingStore();
 
-console.log("settingStore.settings.port", settingStore.settings.port);
-
 const portData = ref({
   port: settingStore.settings.port ?? 8081
   // port: 9210

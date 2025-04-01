@@ -1,6 +1,13 @@
 <template>
   <div v-if="renderEnable" class="index">
     <Header />
+    <Tabs
+      :tabs="tabList"
+      v-model="sessionStore.currentSession"
+      @rightClick="tabOnRightClick"
+      size="small"
+      class="mt-2px"
+    />
     <Main class="main" />
   </div>
 </template>
@@ -13,11 +20,50 @@ import { PortEvent } from "@/enum/port";
 import { windowManager } from "@/stores/WindowManager";
 import { useSettingStore } from "@/stores/settings";
 import { useTrafficStore } from "@/stores/traffic";
+import { error } from "@tauri-apps/plugin-log";
 import { message } from "@tauri-apps/plugin-dialog";
-import { onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
+import Tabs from "@/components/tabs/index.vue";
+import { useSessionStore } from "@/stores/session";
+import ContextMenu from "@imengyu/vue3-context-menu";
 
 const renderEnable = ref(false);
 const settingStore = useSettingStore();
+const sessionStore = useSessionStore();
+
+const tabList = computed(() => {
+  return sessionStore.sessionList.map((item) => {
+    return {
+      label:
+        sessionStore.currentListenSession === item.id
+          ? item.label + " *"
+          : item.label,
+      id: item.id
+    };
+  });
+});
+
+const tabOnRightClick = (e: MouseEvent, id: string) => {
+  e.preventDefault();
+  ContextMenu.showContextMenu({
+    x: e.clientX,
+    y: e.clientY,
+    items: [
+      {
+        label: "删除 Session",
+        onClick: () => {
+          sessionStore.removeSession(id);
+        }
+      },
+      {
+        label: "删除所有 Session",
+        onClick: () => {
+          sessionStore.removeAllSession();
+        }
+      }
+    ]
+  });
+};
 
 const portInit = async (port: number) => {
   try {
@@ -27,8 +73,8 @@ const portInit = async (port: number) => {
     renderEnable.value = true;
     await windowManager.window.setFocus();
     // 开始监听流量变化
-  } catch (error) {
-    await message(("端口设置失败：" + error) as string, { kind: "error" });
+  } catch (e) {
+    await message(("端口设置失败：" + e) as string, { kind: "error" });
     const [wvw] = await windowManager.createWindow(
       {
         url: "/setting/port",
@@ -53,7 +99,6 @@ const portInit = async (port: number) => {
 };
 
 const init = async () => {
-  console.log(await windowManager.window.setEnabled(false));
   try {
     // 初始化设置
     await settingStore.portInit();
@@ -63,10 +108,16 @@ const init = async () => {
     // 初始化断点
     await settingStore.initBreakpoint();
 
+    // 初始化 Session
+    await settingStore.initSession();
+
+    // 初始化外挂代理
+    await settingStore.externalProxyInit();
+
     await settingStore.monitorTrafficInit();
-  } catch (error) {
-    console.error("初始化失败:", error);
-    throw error;
+  } catch (e) {
+    error("初始化失败:" + e);
+    throw e;
   }
 };
 
@@ -88,6 +139,6 @@ onUnmounted(() => {
 <style scoped>
 .index {
   background-color: #f2f2f2;
-  height: calc(100% - 74px);
+  height: calc(100% - 124px);
 }
 </style>

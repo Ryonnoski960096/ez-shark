@@ -3,15 +3,15 @@
     <p style="font-size: 13px">
       在请求和响应发送与接收之前对其进行拦截和编辑。
     </p>
-    <!-- <p class="f-l f-g-10">
+    <p v-if="breakpoints" class="f-l f-g-10">
       <span>断点功能:</span>
       <Switch
         size="small"
-        v-model:checked="state.breakpoint"
+        v-model:checked="breakpoints.toolEnabled"
         checked-children="开"
         un-checked-children="关"
       />
-    </p> -->
+    </p>
     <div class="breakpointList">
       <table>
         <thead>
@@ -106,7 +106,8 @@
 </template>
 
 <script setup lang="ts">
-import { Reactive, reactive, ref, watch } from "vue";
+import type { Reactive } from "vue";
+import { reactive, ref, watch } from "vue";
 import {
   Switch,
   Button,
@@ -119,12 +120,11 @@ import Page from "@/components/Page.vue";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import useBreakpointConfig from "@/hooks/useBreakpointConfig";
 import { useSettingStore } from "@/stores/settings";
-import { Breakpoint, Breakpoints } from "@/hooks/useBreakpointConfig";
+import type { Breakpoint, Breakpoints } from "@/hooks/useBreakpointConfig";
 import ContextMenu from "@imengyu/vue3-context-menu";
-import { BreakpointEventName } from "@/enum/event-name";
-import { removeBreakpoint, updateBreakpoint } from "@/api/breakpoint";
-import { isSuccess } from "@/api";
+import { BreakpointEventName } from "@/enum/breakpoint";
 import { windowInit, windowManager } from "@/stores/WindowManager";
+import { error } from "@tauri-apps/plugin-log";
 
 // 窗口初始化
 windowInit();
@@ -148,7 +148,6 @@ const getTableData = async () => {
     toolEnabled: false,
     breakpoints: {}
   };
-  console.log("breakpoints.value", breakpoints.value);
   state.breakpoint = breakpoints.value.toolEnabled ?? false;
 };
 
@@ -183,7 +182,6 @@ const handleAllSwitch = () => {
   if (!breakpoints.value?.breakpoints) return;
 
   const isCurrentlyAllChecked = allSwitch.value;
-  console.log("allChecked", allSwitch.value);
   Object.keys(breakpoints.value.breakpoints).forEach((key) => {
     breakpoints.value!.breakpoints[key].enabled = isCurrentlyAllChecked;
   });
@@ -193,8 +191,6 @@ const handleAllSwitch = () => {
 
 const handleAllChecked = () => {
   if (!breakpoints.value?.breakpoints) return;
-
-  // const isCurrentlyAllChecked = allChecked.value;
   for (let i = 0; i < checkboxArr.length; i++) {
     checkboxArr[i] = allChecked.value;
   }
@@ -208,7 +204,6 @@ watch(
     } else {
       checkboxArr.length = 0;
     }
-    console.log("checkboxArr", checkboxArr);
 
     if (!breakpointsRecord || Object.keys(breakpointsRecord).length === 0) {
       allSwitch.value = false;
@@ -249,7 +244,6 @@ const handleCancel = async () => {
 
 // 关闭前执行检查
 async function handleCloseExamine() {
-  console.log("newIds.value", newIds.value);
   if (newIds.value.length !== 0) {
     const res = await confirm("当前有未保存的配置，是否确认关闭？", {
       kind: "warning",
@@ -279,23 +273,13 @@ const removeIds = ref<string[]>([]);
 
 // 点击确定
 const handleOk = async () => {
-  const breakpointList = [];
-  for (const key in breakpoints.value!.breakpoints) {
-    breakpointList.push(breakpoints.value!.breakpoints[key]);
-  }
-
-  await updateBreakpoint(breakpointList);
-
-  if (
-    removeIds.value.length !== 0 &&
-    !isSuccess(await removeBreakpoint(removeIds.value))
-  ) {
-    return message.error("删除配置失败");
-  }
-
   await settingStore.set("breakpoints", breakpoints.value);
   windowManager.closeTasks.delete(handleCloseExamine);
-
+  windowManager.window.emitTo(
+    "main",
+    BreakpointEventName.BREAKPOINT_CHANGED,
+    breakpoints.value
+  );
   handleCancel();
 };
 
@@ -316,11 +300,9 @@ const importHandler = async () => {
       await settingStore.set("breakpoints", importedBreakpoints);
       breakpoints.value = importedBreakpoints;
     });
-  } catch (error) {
-    console.error("导入失败", error);
-    message.error(
-      `导入失败：${error instanceof Error ? error.message : "未知错误"}`
-    );
+  } catch (e) {
+    error("导入失败" + e);
+    message.error(`导入失败：${e instanceof Error ? e.message : "未知错误"}`);
   }
 };
 
@@ -334,11 +316,9 @@ const exportHandler = async () => {
     if (savePath && breakpoints.value) {
       await exportConfig(savePath, breakpoints.value);
     }
-  } catch (error) {
-    console.error("导出失败", error);
-    message.error(
-      `导出失败：${error instanceof Error ? error.message : "未知错误"}`
-    );
+  } catch (e) {
+    error("导出失败" + e);
+    message.error(`导出失败：${e instanceof Error ? e.message : "未知错误"}`);
   }
 };
 
@@ -359,7 +339,6 @@ const openWindow = async (ops?: Record<string, any>) => {
   const unListen = await wvw.listen(BreakpointEventName.SUBMIT, (event) => {
     try {
       const payload = event.payload as Breakpoint;
-      console.log("data", payload);
       if (!breakpoints.value) {
         breakpoints.value = {
           toolEnabled: false,
@@ -369,17 +348,14 @@ const openWindow = async (ops?: Record<string, any>) => {
 
       const [key, breakpoint] = createBreakpoint(payload);
       breakpoints.value.breakpoints[key] = breakpoint;
-      console.log("breakpoints.value", breakpoints.value);
 
       settingStore.set("breakpoints", breakpoints.value);
 
       newIds.value.push(key);
       message.success("添加成功");
-    } catch (error) {
-      console.error(error);
-      message.error(
-        `添加失败：${error instanceof Error ? error.message : "未知错误"}`
-      );
+    } catch (e) {
+      error(e + "");
+      message.error(`添加失败：${e instanceof Error ? e.message : "未知错误"}`);
     } finally {
       unListen();
     }
@@ -404,7 +380,6 @@ const removeBreakpointList = async () => {
   if (!breakpoints.value) return;
 
   const keys = Object.keys(breakpoints.value.breakpoints);
-  console.log(keys);
   for (let i = 0; i < checkboxArr.length; i++) {
     if (checkboxArr[i]) {
       removeIds.value.push(keys[i]);

@@ -1,7 +1,8 @@
 import { useIpc } from "@/hooks";
-import { ITrafficDataDetail } from "@/stores/traffic";
-import { trafficModificationAPIParams } from "@/window/breakpoint/pause/edit/model";
-import { Response } from "../model";
+import type { ITrafficDataDetail } from "@/stores/traffic";
+import type { trafficModificationAPIParams } from "@/components/contents/model";
+import type { Response } from "../model";
+import { useSessionStore } from "@/stores/session";
 
 const ipc = useIpc();
 
@@ -9,8 +10,10 @@ const ipc = useIpc();
  * 查询流量详情
  */
 export function queryTrafficDetail(id: number) {
+  const sessionStore = useSessionStore();
   return ipc.invoke<ITrafficDataDetail>("get_traffic_detail", {
-    id
+    id,
+    sessionId: sessionStore.currentSession ?? ""
   });
 }
 
@@ -56,5 +59,14 @@ export function onResend(
       modified_type: "resend",
       ...data
     }
+  });
+}
+
+// 删除流量
+export function deleteTraffic(ids: number[]) {
+  const sessionStore = useSessionStore();
+  return ipc.invoke("delete_traffic", {
+    ids,
+    sessionId: sessionStore.currentSession ?? ""
   });
 }

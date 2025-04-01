@@ -1,5 +1,7 @@
 import { defineComponent, ref } from "vue";
-import useBreakpointConfig, { Breakpoint } from "@/hooks/useBreakpointConfig";
+import useBreakpointConfig, {
+  type Breakpoint
+} from "@/hooks/useBreakpointConfig";
 import {
   Form,
   Input,
@@ -11,8 +13,9 @@ import {
 } from "ant-design-vue";
 import Page from "@/components/Page.vue";
 import styles from "./breakpoint.module.css";
-import { BreakpointEventName } from "@/enum/event-name";
+import { BreakpointEventName } from "@/enum/breakpoint";
 import { windowInit, windowManager } from "@/stores/WindowManager";
+import { error } from "@tauri-apps/plugin-log";
 
 // 定义表单字段配置
 const formConfig = [
@@ -169,7 +172,7 @@ export default defineComponent({
         // 关闭窗口
         await windowManager.requestClose();
       } catch (errorInfo) {
-        console.error("表单验证失败:", errorInfo);
+        error("表单验证失败:" + errorInfo);
         message.error((errorInfo as Error).message);
       }
     };

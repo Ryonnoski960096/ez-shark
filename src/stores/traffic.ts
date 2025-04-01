@@ -2,23 +2,26 @@ import { useIpc } from "@/hooks";
 import { defineStore } from "pinia";
 import { ref } from "vue";
 import { windowManager } from "./WindowManager";
-import { BreakpointPauseEventName } from "@/enum/event-name";
+import { BreakpointPauseEventName } from "@/enum/breakpoint";
 import { emit } from "@tauri-apps/api/event";
-import { Payload } from "@/api/model";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import type { Payload } from "@/api/model";
+import type { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { error } from "@tauri-apps/plugin-log";
+import { useSessionStore } from "./session";
 
 export enum TransactionState {
-  Pending, // 初始化/等待发送
-  Requesting, // 正在发送请求
-  Responding, // 正在接收响应
-  ResponseDone, // 响应接收完成
-  Completed, // 完整完成
-  Failed, // 失败
-  Aborted // 中止
+  Pending = "Pending", // 初始化/等待发送
+  Requesting = "Requesting", // 正在发送请求
+  Responding = "Responding", // 正在接收响应
+  ResponseDone = "ResponseDone", // 响应接收完成
+  Completed = "Completed", // 完整完成
+  Failed = "Failed", // 失败
+  Aborted = "Aborted" // 中止
 }
 
 // 保留原有的 TrafficData
-export interface TrafficData {
+export interface TrafficData
+  extends Record<string, number | string | null | TransactionState> {
   id: number;
   method: string;
   mime: string;
@@ -30,6 +33,7 @@ export interface TrafficData {
   host: string | null;
   transaction_state: TransactionState;
   start_time: string | null;
+  session_id: string;
 }
 
 // 头部项接口
@@ -87,12 +91,25 @@ interface ITrafficData<H = IHeaders> {
     res_body_size: number;
     res_body_hex: HexBody[];
     websocket_id: string | null;
+    transaction_state: TransactionState;
     start_time: string;
     end_time: string;
     error: string | null;
   };
 }
-interface ITrafficDataDetail<H = IHeaders> extends ITrafficData<H> {
+interface Overview extends Record<string, any> {
+  url: string;
+  method: string;
+  status: string;
+  code?: number | undefined | null;
+  protocol?: string | undefined | null;
+}
+interface ITrafficDataDetail extends Record<string, any> {
+  overview: Overview;
+  req_head_json: string;
+  res_head_json: string;
+  req_body_hex: HexBody[];
+  res_body_hex: HexBody[];
   res_body: RBody;
   req_body: RBody;
 }
@@ -125,15 +142,15 @@ type ResendTrafficHandler = (
 
 export const useTrafficStore = defineStore("traffic", () => {
   const ipc = useIpc();
-
+  const sessionStore = useSessionStore();
   // 流量列表
-  const trafficList = ref<Map<number, TrafficData>>(new Map());
+  const trafficList = ref<Map<string, Map<number, TrafficData>>>(new Map());
 
   // 编辑状态
   const trafficEditStatusMap = ref<Map<number, boolean>>(new Map());
 
   // 搜索模式流量列表
-  const searchMode = ref<Map<number, TrafficData>>(new Map());
+  const searchMode = ref<Map<string, Map<number, TrafficData>>>(new Map());
 
   // 搜索模式
   const isSearchMode = ref(false);
@@ -142,7 +159,7 @@ export const useTrafficStore = defineStore("traffic", () => {
   const trafficDetail = ref<ITrafficDataDetail | null>(null);
 
   // 当前选中的流量id
-  const currentTrafficId = ref<number | null>(null);
+  const currentTrafficId = ref<Map<string, number | null>>(new Map());
 
   // 流量监听状态
   const isListenerMode = ref<boolean>(false);
@@ -181,8 +198,15 @@ export const useTrafficStore = defineStore("traffic", () => {
       return highlightedText;
     };
 
+    if (!sessionStore.currentSession) return;
+    const hasTraffics = trafficList.value.has(sessionStore.currentSession);
+    if (!hasTraffics) {
+      trafficList.value.set(sessionStore.currentSession, new Map());
+    }
+    const traffics = trafficList.value.get(sessionStore.currentSession);
+    if (!traffics) return;
     // 遍历trafficList进行搜索
-    trafficList.value.forEach((traffic, id) => {
+    traffics.forEach((traffic, id) => {
       // 转换关键词为小写，方便不区分大小写搜索
       const lowercaseKeyword = keyword.toLowerCase();
 
@@ -211,8 +235,19 @@ export const useTrafficStore = defineStore("traffic", () => {
         highlightedTraffic.status = Number(
           highlightText(String(traffic.status), keyword)
         );
+        if (!sessionStore.currentSession) return;
 
-        searchMode.value.set(id, highlightedTraffic as TrafficData);
+        const hasSearchModeTraffics = searchMode.value.get(
+          sessionStore.currentSession
+        );
+        if (!hasSearchModeTraffics) {
+          searchMode.value.set(sessionStore.currentSession, new Map());
+        }
+        const searchModeTraffics = searchMode.value.get(
+          sessionStore.currentSession
+        );
+        if (!searchModeTraffics) return;
+        searchModeTraffics.set(id, highlightedTraffic);
       }
     });
   };
@@ -276,9 +311,7 @@ export const useTrafficStore = defineStore("traffic", () => {
         },
         sendTraffic: (event: { payload: string }) => {
           const key = event.payload;
-          const value = breakpointTrafficMap.value.get(key);
           updateBreakpointData(key);
-          console.log("key", key, breakpointTrafficMap.value, value);
         },
         onResend: (event: { payload: string }) => {
           updateBreakpointData(event.payload);
@@ -294,19 +327,25 @@ export const useTrafficStore = defineStore("traffic", () => {
     try {
       // 分别定义各种处理器
       const newTrafficHandler: NewTrafficHandler = (payload) => {
-        console.log("new-traffic", payload);
-        trafficList.value.set(payload.data.id, payload.data);
+        const sessionId = payload.data.session_id;
+        const trafficId = payload.data.id;
+        const traffic = payload.data;
+        const hasSessionTraffics = trafficList.value.has(sessionId);
+        if (!hasSessionTraffics) {
+          trafficList.value.set(sessionId, new Map());
+        }
+        const sessionTraffic = trafficList.value.get(sessionId);
+        if (!sessionTraffic) return;
+        sessionTraffic.set(trafficId, traffic);
       };
 
       const pauseTrafficHandler: PauseTrafficHandler = async (payload) => {
-        console.log("pause-traffic", payload);
         const [key, value] = payload.data;
         breakpointTrafficMap.value.set(key, value);
         await createTrafficWindow(windowManager, setBreakpointPauseListener);
       };
 
       const resendTrafficHandler: ResendTrafficHandler = async (payload) => {
-        console.log("resend-traffic", payload);
         const [key, value] = payload.data;
         breakpointTrafficMap.value.set(key, value);
         await createTrafficWindow(windowManager, setBreakpointPauseListener);
@@ -328,9 +367,9 @@ export const useTrafficStore = defineStore("traffic", () => {
         Payload<[string, TrafficEditData<IHeaders>]>
       >("resend-traffic", resendTrafficHandler);
       unListenList.value.push(unlistenResendTraffic);
-    } catch (error) {
-      console.error("Failed to setup traffic monitor:", error);
-      throw new Error(`Traffic monitor setup failed: ${error}`);
+    } catch (e) {
+      error("Failed to setup traffic monitor:" + e);
+      throw new Error(`Traffic monitor setup failed: ${e}`);
     }
   };
 
@@ -365,5 +404,6 @@ export type {
   IBodyContent,
   ITrafficDataDetail,
   TrafficEditData,
-  RBody
+  RBody,
+  Overview
 };

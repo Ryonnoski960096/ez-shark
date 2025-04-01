@@ -5,6 +5,7 @@ import ContextMenu from "@imengyu/vue3-context-menu";
 import { createPinia } from "pinia";
 import router from "./router";
 import { useSettingStore } from "./stores/settings";
+import { error } from "@tauri-apps/plugin-log";
 
 import "element-plus/dist/index.css";
 import "@/assets/style/index.css";
@@ -34,6 +35,6 @@ async function bootstrap() {
 }
 
 // 启动应用
-bootstrap().catch((error) => {
-  console.error("Application failed to start:", error);
+bootstrap().catch((e) => {
+  error("Application failed to start:" + e);
 });

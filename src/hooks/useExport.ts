@@ -3,7 +3,7 @@ import { createXmlStr } from "@/utils/file";
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
 
-export default function useExport() {
+export default function useExport(sessionId: string) {
   /**
    * 保存为markdown
    */
@@ -18,7 +18,7 @@ export default function useExport() {
     });
     if (!path) throw new Error("未选择文件");
 
-    return exportApi(path);
+    return exportApi(path, sessionId);
   };
 
   /**
@@ -35,7 +35,7 @@ export default function useExport() {
     });
     if (!path) throw new Error("未选择文件");
 
-    return exportApi(path);
+    return exportApi(path, sessionId);
   };
 
   /**
@@ -52,7 +52,7 @@ export default function useExport() {
     });
     if (!path) throw new Error("未选择文件");
 
-    return exportApi(path);
+    return exportApi(path, sessionId);
   };
 
   /**
@@ -69,29 +69,29 @@ export default function useExport() {
     });
     if (!path) throw new Error("未选择文件");
 
-    return exportApi(path);
-  };
-
-  const exportXML = async (xmlObj: object) => {
-    // if (!xmlObj) throw new Error("");
-    const path = await save({
-      filters: [
-        {
-          name: "Xml",
-          extensions: ["xml"]
-        }
-      ]
-    });
-    if (!path) throw new Error("未选择文件");
-
-    return await writeTextFile(path, createXmlStr({ externalProxy: xmlObj }));
+    return exportApi(path, sessionId);
   };
 
   return {
     exportMarkdown,
     exportJson,
     exportHar,
-    exportCurl,
-    exportXML
+    exportCurl
   };
 }
+
+const exportXML = async (xmlObj: object) => {
+  const path = await save({
+    filters: [
+      {
+        name: "Xml",
+        extensions: ["xml"]
+      }
+    ]
+  });
+  if (!path) throw new Error("未选择文件");
+
+  return await writeTextFile(path, createXmlStr({ externalProxy: xmlObj }));
+};
+
+export { exportXML };

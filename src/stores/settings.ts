@@ -1,14 +1,18 @@
 import { defineStore } from "pinia";
 import { ref } from "vue";
 import { Store } from "@tauri-apps/plugin-store";
-import { updateBreakpoint } from "@/api/breakpoint";
 import { windowManager } from "./WindowManager";
 import { useTrafficStore } from "./traffic";
 import { invoke } from "@tauri-apps/api/core";
+import { defaultData as defaultExternalProxyData } from "@/window/externalProxy/model";
+import { debug, error } from "@tauri-apps/plugin-log";
+import { useSessionStore } from "./session";
+import { changeMonitorTraffic } from "@/api/server";
 
 // 定义设置接口
 export const useSettingStore = defineStore("setting", () => {
   const trafficStore = useTrafficStore();
+  const sessionStore = useSessionStore();
 
   const store = ref<Promise<Store>>(
     Store.load("settings.json", {
@@ -29,15 +33,39 @@ export const useSettingStore = defineStore("setting", () => {
 
       await set("breakpoints", settings.value.breakpoints);
     }
+  };
 
-    if (windowManager.isMainWindow()) {
-      const breakpointList = [];
-      for (const key in settings.value.breakpoints.breakpoints) {
-        breakpointList.push(settings.value.breakpoints.breakpoints[key]);
-      }
-
-      await updateBreakpoint(breakpointList);
+  /**
+   * 初始化 Session
+   * 这个方法必须在init之后
+   */
+  const initSession = async () => {
+    if (!settings.value.currentSession) {
+      settings.value.currentSession = "1";
+      await set("currentSession", settings.value.currentSession);
     }
+    if (
+      !settings.value.sessionList ||
+      settings.value.sessionList.length === 0
+    ) {
+      settings.value.sessionList = [
+        {
+          id: "1",
+          label: "Session 1"
+        }
+      ];
+      await set("sessionList", settings.value.sessionList);
+    }
+
+    if (!settings.value.currentListenSession) {
+      await set("currentListenSession", "");
+    }
+
+    sessionStore.sessionList = settings.value.sessionList;
+    sessionStore.currentSession = settings.value.currentSession;
+
+    sessionStore.currentListenSession = settings.value.currentListenSession;
+    await changeMonitorTraffic(sessionStore.currentListenSession!);
   };
 
   /**
@@ -56,8 +84,21 @@ export const useSettingStore = defineStore("setting", () => {
    */
   const monitorTrafficInit = async () => {
     return invoke("change_monitor_traffic", {
-      monitorTraffic: trafficStore.isListenerMode
+      monitorTraffic: sessionStore.currentSession
     });
+  };
+
+  /**
+   * 外挂代理init
+   * 这个方法必须在init之后
+   */
+  const externalProxyInit = async () => {
+    if (
+      settings.value.externalProxy &&
+      settings.value.externalProxy.bypassDomains
+    )
+      return;
+    await set("externalProxy", defaultExternalProxyData);
   };
 
   /**
@@ -70,13 +111,14 @@ export const useSettingStore = defineStore("setting", () => {
       for (const [key, value] of entries) {
         settings.value[key] = value;
       }
-      console.log("settings.value:", settings.value);
+      debug("settings.value:", settings.value);
+      console.log("settings:", settings.value);
 
       trafficStore.isAutoScroll = settings.value.isAutoScroll ?? false;
       trafficStore.isListenerMode = settings.value.isListenerMode ?? false;
-    } catch (error) {
-      console.error("Failed to initialize store.value:", error);
-      throw error;
+    } catch (e) {
+      error("Failed to initialize store.value:" + e);
+      throw e;
     }
   };
 
@@ -88,11 +130,10 @@ export const useSettingStore = defineStore("setting", () => {
     try {
       const s = await store.value;
       await s.set(key, value);
-      // console.log(`Set ${key} to `, value);
       settings.value[key] = value;
-    } catch (error) {
-      console.error(`Failed to set ${key}:`, error);
-      throw error;
+    } catch (e) {
+      error(`Failed to set ${key}:${e}`);
+      throw e;
     }
   };
 
@@ -103,9 +144,9 @@ export const useSettingStore = defineStore("setting", () => {
 
     try {
       return settings.value[key];
-    } catch (error) {
-      console.error(`Failed to get ${key}:`, error);
-      throw error;
+    } catch (e) {
+      error(`Failed to get ${key}:${e}`);
+      throw e;
     }
   };
 
@@ -118,9 +159,9 @@ export const useSettingStore = defineStore("setting", () => {
       const s = await store.value;
       await s.delete(key);
       delete settings.value[key];
-    } catch (error) {
-      console.error(`Failed to remove ${key}:`, error);
-      throw error;
+    } catch (e) {
+      error(`Failed to remove ${key}:${e}`);
+      throw e;
     }
   };
 
@@ -133,9 +174,9 @@ export const useSettingStore = defineStore("setting", () => {
       const s = await store.value;
       await s.clear();
       settings.value = {};
-    } catch (error) {
-      console.error("Failed to clear store.value:", error);
-      throw error;
+    } catch (e) {
+      error("Failed to clear store.value:" + e);
+      throw e;
     }
   };
 
@@ -146,9 +187,11 @@ export const useSettingStore = defineStore("setting", () => {
   return {
     store,
     settings,
+    externalProxyInit,
     monitorTrafficInit,
     portInit,
     initBreakpoint,
+    initSession,
     init,
     set,
     get,

@@ -1,4 +1,4 @@
-# Ez-Shark
+# EzShark
 
 ## feature
 

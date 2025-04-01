@@ -1,4 +1,4 @@
 export interface Tab {
-  id: number;
+  id: string;
   label: string;
 }

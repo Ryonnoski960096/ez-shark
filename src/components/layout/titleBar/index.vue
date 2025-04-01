@@ -39,7 +39,6 @@ win.isMaximized().then((maximized) => {
 });
 
 const handleMaximize = async () => {
-  console.log("双击");
   if (await win.isMaximized()) {
     await win.unmaximize();
     isMaximized.value = false;

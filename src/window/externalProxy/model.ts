@@ -31,5 +31,51 @@ interface ExternalProxy {
   alwaysBypassLocalhost: boolean;
 }
 
+const defaultData: ExternalProxy = {
+  configurations: {
+    entry: [
+      {
+        string: ProxyType.HTTP,
+        mutableExternalProxyConfiguration: {
+          requiresAuthentication: false,
+          host: "",
+          port: 8080,
+          domain: "",
+          username: "",
+          encryptedPassword: ""
+        }
+      },
+      {
+        string: ProxyType.HTTPS,
+        mutableExternalProxyConfiguration: {
+          requiresAuthentication: false,
+          host: "",
+          port: 443,
+          domain: "",
+          username: "",
+          encryptedPassword: ""
+        }
+      },
+      {
+        string: ProxyType.SOCKS,
+        mutableExternalProxyConfiguration: {
+          requiresAuthentication: false,
+          host: "",
+          port: 1080,
+          domain: "",
+          username: "",
+          encryptedPassword: ""
+        }
+      }
+    ]
+  },
+  bypassDomains: {
+    string: []
+  },
+  proxyType: ProxyType.HTTP,
+  enabled: false,
+  alwaysBypassLocalhost: true
+};
+
 export type { MutableExternalProxyConfiguration, Entry, ExternalProxy };
-export { ProxyType };
+export { ProxyType, defaultData };

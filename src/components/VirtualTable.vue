@@ -1,5 +1,11 @@
 <template>
-  <div ref="containerRef" class="virtual-table-container">
+  <div
+    tabindex="0"
+    @keydown.prevent="onKeydown($event)"
+    @keyup.prevent="onKeyup($event)"
+    ref="containerRef"
+    class="virtual-table-container"
+  >
     <!-- 表头 -->
     <div class="table-header">
       <div
@@ -44,13 +50,22 @@
             :key="item.id"
             class="virtual-row"
             :style="{ height: `${rowHeight}px` }"
-            :class="{ 'row-active': active === item.id }"
+            :class="{
+              'row-active': active === item.id,
+              'row-active-select': ids && ids.has(item.id)
+            }"
             @click.stop="onCellClick(item)"
+            @dblclick="onDbLCellClick(item)"
             @click.right="onContextMenu($event, item)"
+            @mousedown="onMouseDown($event, item)"
+            @mouseup="onMouseUp($event, item)"
+            @mouseenter="onMouseEnter($event, item)"
           >
+            <!-- :title="getTooltipContent(String(item[column.key]))" -->
             <div
+              :title="String(item[column.key])"
               v-for="(column, index) in localColumns"
-              :key="column.key"
+              :key="column.key + '-' + index + '-cell' + item.id"
               class="cell"
               :class="{ 'flex-grow': index === localColumns.length - 1 }"
               :style="column.isFlex ? {} : { width: `${column.width}px` }"
@@ -58,29 +73,30 @@
               <!-- :get-popup-container="
                   (triggerNode) => triggerNode.parentNode as HTMLElement
                 " -->
-              <Tooltip
-                v-if="shouldShowTooltip(item[column.key], column)"
+              <!-- <Tooltip
+                v-if="shouldShowTooltip(String(item[column.key]), column)"
                 :destroyTooltipOnHide="false"
                 :disabled="resizeState.isResizing"
                 :mouseEnterDelay="0.3"
                 placement="topLeft"
               >
                 <template #title>
-                  <div class="tooltip-content">
-                    {{ getTooltipContent(item[column.key]) }}
-                  </div>
+                  <div
+                    v-html="getTooltipContent(String(item[column.key]))"
+                    class="tooltip-content"
+                  />
                 </template>
                 <template #default>
                   <span
                     class="cell-content"
-                    v-html="formatCellContent(item[column.key], column)"
+                    v-html="formatCellContent(String(item[column.key]), column)"
                   />
                 </template>
-              </Tooltip>
+              </Tooltip> -->
+              <!-- v-else -->
               <span
-                v-else
                 class="cell-content"
-                v-html="formatCellContent(item[column.key], column)"
+                v-html="formatCellContent(String(item[column.key]), column)"
               ></span>
             </div>
           </div>
@@ -91,18 +107,9 @@
 </template>
 
 <script setup lang="ts">
-import {
-  ref,
-  computed,
-  onMounted,
-  onUnmounted,
-  reactive,
-  watch,
-  nextTick
-} from "vue";
-import { useTableLayoutStore } from "@/stores/table-layout";
-import { Tooltip } from "ant-design-vue";
-import { TrafficData, useTrafficStore } from "@/stores/traffic";
+import { ref, computed, onMounted, reactive, watch, nextTick } from "vue";
+import { type TrafficData, useTrafficStore } from "@/stores/traffic";
+import { useSessionStore } from "@/stores/session";
 
 interface Column {
   key: string;
@@ -121,15 +128,156 @@ interface Props {
   tableId: string;
   active: number | null;
 }
+const props = withDefaults(defineProps<Props>(), {
+  rowHeight: 40
+});
+
+const ids = defineModel<Set<number>>("ids", {
+  required: false
+});
 
 const emit = defineEmits<{
-  (e: "onCellClick", item: any): void;
-  (e: "onContextMenu", event: any, traffic: TrafficData): void;
+  onCellClick: [item: TrafficData];
+  onDbLCellClick: [item: TrafficData];
+  onContextMenu: [event: any, traffic: TrafficData];
+  onCellMouseDown: [event: MouseEvent, traffic: TrafficData];
+  onCellMouseUp: [event: MouseEvent, traffic: TrafficData];
+  onCellMouseEnter: [event: MouseEvent, traffic: TrafficData];
+  onCellKeydown: [event: KeyboardEvent];
+  onCellKeyup: [event: KeyboardEvent];
 }>();
+// 处理按下拖动多选
+const multiSelect = ref<{
+  startId: number;
+  endId: number;
+  isMouseSelecting: boolean;
+  isShiftSelecting: boolean;
+  isCtrlSelecting: boolean;
+}>({
+  startId: -1,
+  endId: -1,
+  isMouseSelecting: false,
+  isShiftSelecting: false,
+  isCtrlSelecting: false
+});
 
 // 抛出点击事件
-const onCellClick = (item: any) => {
-  emit("onCellClick", item);
+const onCellClick = (traffic: TrafficData) => {
+  emit("onCellClick", traffic);
+};
+
+// 抛出双击事件
+const onDbLCellClick = (traffic: TrafficData) => {
+  emit("onDbLCellClick", traffic);
+};
+
+const sessionStore = useSessionStore();
+
+watch(
+  () => sessionStore.currentSession,
+  () => {
+    ids.value = new Set();
+  }
+);
+
+const getTrafficsBetweenIds = (startId: number, endId: number) => {
+  if (!sessionStore.currentSession) return [];
+  const list = trafficStore.trafficList.get(sessionStore.currentSession);
+  if (!list) return [];
+  // 将 Map 转换为数组
+  const trafficList = Array.from(list.values());
+
+  const startIndex = trafficList.findIndex((t) => t.id === startId);
+  const endIndex = trafficList.findIndex((t) => t.id === endId);
+
+  // 如果找不到，返回空
+  if (startIndex === -1 || endIndex === -1) return [];
+
+  // 确定正确的起始和结束索引
+  const actualStart = Math.min(startIndex, endIndex);
+  const actualEnd = Math.max(startIndex, endIndex);
+
+  // 返回这个区间的流量
+  return trafficList.slice(actualStart, actualEnd + 1);
+};
+
+let fistId = -1;
+
+// 鼠标按下事件
+const onMouseDown = (e: MouseEvent, traffic: TrafficData) => {
+  emit("onCellMouseDown", e, traffic);
+  if (!ids.value) return;
+  multiSelect.value.startId = fistId;
+  if (multiSelect.value.isCtrlSelecting) {
+    if (ids.value.has(traffic.id)) {
+      ids.value.delete(traffic.id);
+      return;
+    }
+
+    ids.value.add(traffic.id);
+    return;
+  } else {
+    if (e.button === 2) return;
+    ids.value.clear();
+  }
+
+  if (multiSelect.value.isShiftSelecting) {
+    multiSelect.value.endId = traffic.id;
+
+    if (!multiSelect.value.startId || !multiSelect.value.endId) return;
+
+    const trafficsBetween = getTrafficsBetweenIds(
+      multiSelect.value.startId,
+      traffic.id
+    );
+    trafficsBetween.forEach((t) => ids.value?.add(t.id));
+    return;
+  }
+  multiSelect.value.isMouseSelecting = true;
+  fistId = traffic.id;
+};
+
+// 抛出鼠标抬起事件
+const onMouseUp = (e: MouseEvent, traffic: TrafficData) => {
+  emit("onCellMouseUp", e, traffic);
+  if (!ids.value) return;
+  multiSelect.value.isMouseSelecting = false;
+};
+
+// 键盘按下事件
+const onKeydown = (e: KeyboardEvent) => {
+  emit("onCellKeydown", e);
+  if (!ids.value) return;
+  if (multiSelect.value.isShiftSelecting || multiSelect.value.isCtrlSelecting)
+    return;
+  e.preventDefault();
+  if (e.shiftKey) {
+    if (multiSelect.value.isShiftSelecting) return;
+
+    multiSelect.value.isShiftSelecting = true;
+  }
+  if (e.ctrlKey) {
+    if (multiSelect.value.isCtrlSelecting) return;
+
+    multiSelect.value.isCtrlSelecting = true;
+  }
+};
+
+// 键盘抬起事件
+const onKeyup = (e: KeyboardEvent) => {
+  emit("onCellKeyup", e);
+  e.preventDefault();
+  if (!ids.value) return;
+  if (e.key === "Shift") {
+    if (!multiSelect.value.isShiftSelecting) return;
+
+    multiSelect.value.isShiftSelecting = false;
+  }
+  if (e.key === "Control") {
+    if (!multiSelect.value.isCtrlSelecting) return;
+
+    multiSelect.value.isCtrlSelecting = false;
+  }
 };
 
 // 抛出右键事件
@@ -137,13 +285,38 @@ const onContextMenu = (e: MouseEvent, traffic: TrafficData) => {
   emit("onContextMenu", e, traffic);
 };
 
-const props = withDefaults(defineProps<Props>(), {
-  rowHeight: 40
-});
+let lastId = -1;
+// 处理拖动多选
+const handleMultiSelect = (traffic: TrafficData) => {
+  if (!ids.value) return;
+  if (!multiSelect.value.isMouseSelecting) return;
 
-const tableLayoutStore = useTableLayoutStore();
+  // 处理第一次拖动
+  if (!ids.value.has(fistId)) {
+    ids.value.add(fistId);
+  }
 
-// 在 script 部分添加以下内容
+  // 处理拖动后往回拖
+  if (ids.value.has(traffic.id)) {
+    if (ids.value.has(lastId)) {
+      ids.value.delete(lastId);
+    }
+    ids.value.delete(traffic.id);
+    return;
+  }
+
+  // 正常选择
+  ids.value.add(traffic.id);
+  lastId = traffic.id;
+};
+
+// 鼠标进入事件
+const onMouseEnter = (e: MouseEvent, traffic: TrafficData) => {
+  emit("onCellMouseEnter", e, traffic);
+  if (!ids.value) return;
+  if (!multiSelect.value.isMouseSelecting) return;
+  handleMultiSelect(traffic);
+};
 
 // 定义排序方向类型
 type SortDirection = "asc" | "desc" | null;
@@ -198,8 +371,8 @@ const compareValues = (a: any, b: any, column: string): number => {
 };
 
 // 修改 visibleData 计算属性
-const visibleData = computed(() => {
-  let sortedData = [...props.data];
+const visibleData = computed<TrafficData[]>(() => {
+  const sortedData = [...props.data];
 
   // 如果有排序状态，进行排序
   if (sortState.key && sortState.direction) {
@@ -219,86 +392,63 @@ const visibleData = computed(() => {
 });
 
 // 格式化单元格内容
-const formatCellContent = (value: string, column: Column) => {
+const formatCellContent = (value: string | null, column: Column) => {
   return column.formatter ? column.formatter(value) : value;
 };
 
 // 是否显示 Tooltip
-const shouldShowTooltip = (value: string, column: Column) => {
-  // console.log(column);
-  // 如果内容为空或很短，不显示 Tooltip
-  if (!value) return false;
+// const shouldShowTooltip = (value: string | null, column: Column) => {
+//   // 如果内容为空或很短，不显示 Tooltip
+//   if (!value) return false;
 
-  if (resizeState.isResizing) return false;
+//   if (resizeState.isResizing) return false;
+//   const cellWidth =
+//     typeof column.width === "number" && column.width === 0 ? column.width : 128;
 
-  if (column.key === "transaction_state") return false;
-  // console.log(column);
-  const cellWidth =
-    typeof column.width === "number" && column.width === 0 ? column.width : 128;
+//   let contentDom = document.getElementById("Measurer");
 
-  let contentDom = document.getElementById("Measurer");
+//   if (!contentDom) {
+//     contentDom = document.createElement("div");
+//     contentDom.id = "Measurer";
+//     contentDom.style.cssText = `
+//         white-space: nowrap;
+//         position: absolute;
+//         left: -9999px;
+//         visibility: hidden;
+//       `;
 
-  if (!contentDom) {
-    contentDom = document.createElement("div");
-    contentDom.id = "Measurer";
-    contentDom.style.cssText = `
-        white-space: nowrap;
-        position: absolute;
-        left: -9999px;
-        visibility: hidden;
-      `;
+//     document.body.appendChild(contentDom);
+//   }
+//   contentDom.textContent =
+//     column.key === "start_time"
+//       ? formatCellContent(value, column)
+//       : (value ?? "");
+//   const contentWidth = contentDom.offsetWidth;
 
-    document.body.appendChild(contentDom);
-  }
-  contentDom.textContent =
-    column.key === "start_time"
-      ? formatCellContent(value, column)
-      : (value ?? "");
-  const contentWidth = contentDom.offsetWidth;
-
-  return cellWidth < contentWidth;
-};
+//   return cellWidth < contentWidth;
+// };
 
 // 获取 Tooltip 内容
-const getTooltipContent = (value: string) => {
-  const MAX_LENGTH = 600;
+// const getTooltipContent = (value: string | null) => {
+//   const MAX_LENGTH = 600;
+//   // 如果内容为空，返回空字符串
+//   if (!value) return "";
 
-  // 转换为字符串并限制长度
-  const content = String(value);
-  if (content.length <= MAX_LENGTH) {
-    return content;
-  }
+//   // 转换为字符串并限制长度
+//   const content = String(value);
+//   if (content.length <= MAX_LENGTH) {
+//     return content;
+//   }
 
-  // 超过长度限制时截断并添加省略号
-  return content.slice(0, MAX_LENGTH) + ". . .";
-};
-
-// 初始化列配置，优先使用存储的配置
-const initColumns = () => {
-  // 首先尝试获取已存储的配置
-  const storedColumns = tableLayoutStore.getColumnLayout(props.tableId);
-
-  // 如果没有存储的配置，使用当前props的columns并保存
-  if (storedColumns.length === 0) {
-    const initialColumns = props.columns.map((col) => ({
-      key: col.key,
-      width: typeof col.width === "number" ? col.width : 10, // 默认10%
-      minWidth: col.minWidth || 50
-    }));
-
-    // 保存初始配置
-    tableLayoutStore.saveColumnLayout(props.tableId, initialColumns);
-    return initialColumns;
-  }
-
-  return storedColumns;
-};
+//   // 超过长度限制时截断并添加省略号
+//   return content.slice(0, MAX_LENGTH) + ". . .";
+// };
 
 // 父容器宽度
 const parentWidth = ref(0);
 
 // 计算列宽
-const computedWidth = (columns: any[], parentWidth: number) => {
+const computedWidth = (columns: Column[], parentWidth: number) => {
   return columns.map((col, index) => {
     // 如果是最后一列，标记为flex
     if (index === columns.length - 1) {
@@ -332,7 +482,9 @@ const computedWidth = (columns: any[], parentWidth: number) => {
 };
 
 // 响应式列配置
-const localColumns = ref(computedWidth(initColumns(), parentWidth.value));
+const localColumns = ref<Column[]>(
+  computedWidth(props.columns, parentWidth.value)
+);
 
 // Refs
 const containerRef = ref<HTMLDivElement | null>(null);
@@ -383,14 +535,6 @@ const onResize = (e: MouseEvent) => {
 
   // 更新列宽
   column.width = newWidth;
-
-  // 保存到 store，传入父容器宽度
-  tableLayoutStore.updateColumnWidth(
-    props.tableId,
-    column.key,
-    newWidth,
-    parentWidth.value
-  );
 };
 
 // 结束调整
@@ -413,17 +557,6 @@ const totalHeight = computed(() => {
 // 计算可视区域高度
 const visibleHeight = ref(0);
 
-// 计算可见数据
-// const visibleData = computed(() => {
-//   const startIndex = Math.floor(scrollTop.value / props.rowHeight);
-//   const endIndex = Math.min(
-//     startIndex + Math.ceil(visibleHeight.value / props.rowHeight) + 10,
-//     props.data.length
-//   );
-
-//   return props.data.slice(startIndex, endIndex);
-// });
-
 // 计算起始偏移量
 const startOffset = computed(() => {
   const startIndex = Math.floor(scrollTop.value / props.rowHeight);
@@ -444,18 +577,12 @@ const adjustContainerHeight = () => {
   const rect = parentElement.getBoundingClientRect();
   parentWidth.value = rect.width;
 
-  // 获取存储的列配置
-  const storedColumns = tableLayoutStore.getColumnLayout(props.tableId);
-
   // 如果没有存储的配置，使用初始配置
-  const columnsToCompute =
-    storedColumns.length > 0
-      ? storedColumns
-      : props.columns.map((col) => ({
-          key: col.key,
-          width: typeof col.width === "number" ? col.width : 10, // 默认10%
-          minWidth: col.minWidth || 50
-        }));
+  const columnsToCompute = props.columns.map((col) => ({
+    key: col.key,
+    width: typeof col.width === "number" ? col.width : 10, // 默认10%
+    minWidth: col.minWidth || 50
+  }));
 
   // 重新计算列宽
   localColumns.value = computedWidth(
@@ -486,6 +613,26 @@ const scrollToBottom = () => {
   scrollContainer.scrollTo({
     top: scrollContainer.scrollHeight,
     behavior: "smooth"
+  });
+};
+
+const scrollToId = (id: number) => {
+  // 首先找到对应 ID 的数据项在整个数据集中的索引
+  const index = props.data.findIndex((item) => item.id === id);
+  if (index === -1) return; // 如果没找到，直接返回
+
+  // 计算目标行的垂直位置
+  const targetScrollTop = index * props.rowHeight;
+
+  // 使用 nextTick 确保 DOM 已更新
+  nextTick(() => {
+    if (!scrollContainerRef.value) return;
+
+    // 平滑滚动到目标位置
+    scrollContainerRef.value.scrollTo({
+      top: targetScrollTop - visibleHeight.value / 2 + props.rowHeight / 2,
+      behavior: "smooth"
+    });
   });
 };
 
@@ -534,23 +681,10 @@ onMounted(() => {
   adjustContainerHeight();
   initResizeObserver();
 });
-
-// 卸载清理
-onUnmounted(() => {
-  // 保存最终的列配置，确保使用百分比
-  tableLayoutStore.saveColumnLayout(
-    props.tableId,
-    localColumns.value.map((col) => ({
-      key: col.key,
-      width: Number(((col.width / parentWidth.value) * 100).toFixed(2)),
-      minWidth: col.minWidth
-    }))
-  );
-});
-
 // 对外暴露一些方法（可选）
 defineExpose({
-  adjustContainerHeight
+  adjustContainerHeight,
+  scrollToId
 });
 </script>
 
@@ -563,7 +697,14 @@ defineExpose({
   border-radius: 8px;
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
 }
+.virtual-table-container * {
+  user-select: none;
+}
 
+.virtual-table-container:focus {
+  outline: none; /* 移除默认轮廓 */
+  box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2); /* 自定义焦点指示 */
+}
 .table-header {
   display: flex;
   background-color: #f8f9fa;
@@ -584,7 +725,6 @@ defineExpose({
   border-right: 1px solid #e0e0e0;
   position: relative;
   user-select: none;
-  transition: background-color 0.2s ease;
   /* flex: 1; */
   min-width: 0;
   overflow: hidden;
@@ -632,27 +772,27 @@ defineExpose({
   display: flex;
   align-items: center;
   border-bottom: 1px solid #e9ecef;
-  transition:
-    background-color 0.2s ease,
-    transform 0.05s ease;
 }
 
 /* 选中状态的优先级要高于hover状态 */
 .row-active {
-  background-color: #e6f2ff;
-  border-left: 3px solid #3498db;
+  background-color: #b7d0ea;
+  border-left: 3px solid #0a5383;
+}
+
+.row-active-select {
+  background-color: #b7baea;
+  border-left: 3px solid #0a2883;
 }
 
 /* 悬浮状态，但未选中 */
-.virtual-row:hover:not(.row-active) {
-  background-color: #f8f9fa;
-  transform: translateX(5px);
+.virtual-row:hover:not(.row-active):not(.row-active-select) {
+  background-color: #daedff;
 }
 
 /* 选中且悬浮状态 */
 .row-active:hover {
-  background-color: #daeeff;
-  transform: translateX(5px);
+  background-color: #b7d0ea;
 }
 
 .cell {
@@ -663,7 +803,7 @@ defineExpose({
   text-align: left;
   font-size: 14px;
   color: #495057;
-  border-right: 1px solid #f1f3f5;
+  /* border-right: 1px solid #f1f3f5; */
   /* flex: 1; */
   min-width: 0;
 }
