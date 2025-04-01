@@ -31,12 +31,13 @@ const props = withDefaults(defineProps<Props>(), {
   minSize: 100,
   disabled: false
 });
+interface ResizeEvents {
+  resizeStart: [];
+  resizing: [sizes: { first: number; second: number }];
+  resizeEnd: [sizes: { first: number; second: number }];
+}
 
-const emit = defineEmits<{
-  (e: "resizeStart"): void;
-  (e: "resizing", sizes: { first: number; second: number }): void;
-  (e: "resizeEnd", sizes: { first: number; second: number }): void;
-}>();
+const emit = defineEmits<ResizeEvents>();
 
 const splitterRef = ref<HTMLElement | null>(null);
 const isResizing = ref(false);
@@ -134,7 +135,6 @@ const stopResize = () => {
 const setElements = (first: HTMLElement, second: HTMLElement) => {
   firstElement.value = first;
   secondElement.value = second;
-  // console.log("setElements", first, second);
 };
 
 defineExpose({

@@ -1,14 +1,12 @@
-// 重新整理思路
-// 重新设计调度器
 import { WindowEvent } from "@/enum/window";
 import useUrlParams from "@/hooks/useUrlParams";
-import { WebviewOptions } from "@tauri-apps/api/webview";
+import type { WebviewOptions } from "@tauri-apps/api/webview";
 import {
   WebviewWindow,
   getAllWebviewWindows,
   getCurrentWebviewWindow
 } from "@tauri-apps/api/webviewWindow";
-import { WindowOptions } from "@tauri-apps/api/window";
+import type { WindowOptions } from "@tauri-apps/api/window";
 import { onMounted } from "vue";
 
 export type webviewOps = Omit<WebviewOptions, "x" | "y" | "width" | "height"> &
@@ -135,7 +133,7 @@ export class WindowManager {
           if (result === false) {
             return false;
           }
-        } catch (error) {
+        } catch {
           return false;
         }
       }
@@ -161,12 +159,11 @@ export class WindowManager {
           label: string;
           parentLabel: string;
         };
-        console.log("窗口创建", payload);
         if (!payload) return;
         const parentWebviewWindow = this.windows.get(payload.parentLabel);
         const childrenWindows = new Set<WebviewWindow>();
 
-        let webviewWindow: WebviewWindow | null =
+        const webviewWindow: WebviewWindow | null =
           await this.getWebviewWindowByLabel(payload.label);
 
         if (!webviewWindow) return;
@@ -192,13 +189,10 @@ export class WindowManager {
 
       // 监听窗口关闭事件，删除关联
       this.window.listen(WindowEvent.CLOSE_REQUESTED, async (event) => {
-        // this.window.emit(WindowEvent.CLOSE, payload.label);
-
         if (!event.payload) return;
         const payload = event.payload as string;
 
         const window = this.windows.get(payload);
-        console.log("关闭窗口", this.windows, payload);
         if (!window) return;
 
         const webviewWindow = this.windows.get(payload);

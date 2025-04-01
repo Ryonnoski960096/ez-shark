@@ -1,4 +1,5 @@
-import { defineConfig, Rule } from "unocss";
+import type { Rule } from "unocss";
+import { defineConfig } from "unocss";
 import presetIcons from "@unocss/preset-icons/browser";
 import { flexRules, widthRules, itemRules } from "./src/unocss";
 import { presetUno } from "unocss";

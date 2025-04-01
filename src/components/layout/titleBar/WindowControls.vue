@@ -52,7 +52,6 @@ const handleMinimize = () => {
 };
 
 const handleClose = () => {
-  console.log("请求关闭窗口");
   if (urlParamsObj.windowCloseEnable === "false") return;
   win.emitTo("main", WindowEvent.CLOSE_REQUESTED, win.label);
 };

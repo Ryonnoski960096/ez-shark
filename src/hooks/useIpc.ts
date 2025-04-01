@@ -1,9 +1,10 @@
-import { Event, listen as tauriListen } from "@tauri-apps/api/event";
+import type { Event} from "@tauri-apps/api/event";
+import { listen as tauriListen } from "@tauri-apps/api/event";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
 export interface IpcData<T> {
   code: number;
-  message: String;
+  message: string;
   data: T;
 }
 

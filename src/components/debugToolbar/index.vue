@@ -15,6 +15,7 @@
 <script setup lang="ts">
 import { getTraffics } from "@/api/debug";
 import { useSettingStore } from "@/stores/settings";
+import { debug } from "@tauri-apps/plugin-log";
 import { Button } from "ant-design-vue";
 import { ref } from "vue";
 
@@ -22,7 +23,7 @@ const isOpen = ref(false);
 
 async function getAllTraffics() {
   const res = await getTraffics();
-  console.log(res);
+  debug(res);
 }
 
 defineOptions({

@@ -193,12 +193,14 @@ import {
   ElRadioGroup,
   ElRadio
 } from "element-plus";
-import { Entry, type ExternalProxy, ProxyType } from "./model";
+import type { Entry } from "./model";
+import { type ExternalProxy, ProxyType } from "./model";
 import { windowInit, windowManager } from "@/stores/WindowManager";
 import { commonIE, deepClone } from "@/utils/tools";
-import { useExport, useImport } from "@/hooks";
+import { useImport } from "@/hooks";
 import { cryptoService } from "@/utils/crypto";
 import { useSettingStore } from "@/stores/settings";
+import { exportXML } from "@/hooks/useExport";
 
 interface Protocol {
   label: string;
@@ -285,7 +287,7 @@ const proxyForm = ref<ExternalProxy>({
     string: []
   },
   proxyType: ProxyType.HTTP,
-  enabled: true,
+  enabled: false,
   alwaysBypassLocalhost: true
 });
 
@@ -304,16 +306,12 @@ watch(bypassHosts, (newVal) => {
     .split("\n")
     .filter((item) => item.trim() !== "");
 });
-
-const exportTool = useExport();
 const importTool = useImport();
 
 // 方法
 const importConfig = async () => {
-  // console.log("Import config");
   commonIE(async () => {
     const traffics = await importTool.importXmlFile();
-    console.log("Imported config:", traffics);
 
     proxyForm.value = {
       ...traffics.externalProxy,
@@ -335,7 +333,6 @@ const importConfig = async () => {
 const exportConfig = () => {
   commonIE(async () => {
     const data = deepClone(proxyForm.value);
-    // console.log("Export config", data);
     data.configurations.entry.forEach((config: Entry) => {
       if (config.mutableExternalProxyConfiguration.encryptedPassword) {
         config.mutableExternalProxyConfiguration.encryptedPassword =
@@ -344,14 +341,13 @@ const exportConfig = () => {
           );
       }
     });
-    await exportTool.exportXML(data);
+    await exportXML(data);
   });
 };
 
 const settingStore = useSettingStore();
 
 const saveConfig = async () => {
-  console.log("Save config:", proxyForm.value);
   const data = deepClone(toRaw(proxyForm.value));
   await Promise.all(
     data.configurations.entry.map(async (config: Entry) => {
@@ -388,19 +384,7 @@ onMounted(async () => {
   bypassHosts.value = (externalProxy.bypassDomains.string as string[]).join(
     "\n"
   );
-
-  console.log("External proxy:", proxyForm.value);
-  // if (isRef(bypassDomains)) {
-  //   bypassHosts.value = bypassDomains.value.join("\n");
-  // } else {
-  //   bypassHosts.value = bypassDomains.join("\n");
-  // }
 });
-
-// const showHelp = () => {
-//   console.log("Show help");
-// };
-
 const handleCancel = async () => {
   await windowManager.requestClose();
 };

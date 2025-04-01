@@ -8,25 +8,29 @@ pub mod state;
 pub mod traffic;
 pub mod utils;
 
+use crate::models::{charles, charles::CharlesConverter};
 use crate::{
     cert::CertificateAuthority,
     server::{PrintMode, Server, ServerBuilder},
     state::{DebuggerCommand, State as TrafficState},
-    traffic::{Body, Traffic, TrafficHead},
+    traffic::{Body, SearchQuery, Traffic, TrafficHead},
+    utils::serialize_option_datetime,
 };
-use anyhow::{anyhow, Result};
-use chrono::{DateTime, Datelike, Local};
+use anyhow::Result;
+
+use chrono::{Datelike, Local};
 
 use indexmap::IndexMap;
 use log::info;
 use models::ExternalProxy;
 use serde::Serialize;
-use state::TrafficModification;
+use state::{SearchResult, TrafficModification};
+
 use std::{
     fs,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{atomic::Ordering, Arc},
+    sync::Arc,
     vec,
 };
 use tauri::Manager;
@@ -34,14 +38,34 @@ use tauri::State;
 use tauri_plugin_log::{fern, Target, TargetKind};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_store::StoreBuilder;
+
+use time::OffsetDateTime;
 use tokio::sync::{oneshot, Mutex};
 use tokio::{net::TcpListener, time::Duration};
+use traffic::{extract_mime, BodyHex, TransactionState};
 
-const APP_NAME: &str = "ezshark";
+const APP_NAME: &str = "ez-shark";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Overview {
+    pub url: String,
+    pub method: String,
+    pub status: TransactionState,
+    pub code: Option<u16>,
+    pub protocol: Option<String>,
+    #[serde(serialize_with = "serialize_option_datetime")]
+    pub start_time: Option<OffsetDateTime>,
+    #[serde(serialize_with = "serialize_option_datetime")]
+    pub end_time: Option<OffsetDateTime>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrafficDetail {
-    pub traffic: Traffic,
+    pub overview: Overview,
+    pub req_head_json: Option<String>,
+    pub res_head_json: Option<String>,
+    pub req_body_hex: Option<Vec<BodyHex>>,
+    pub res_body_hex: Option<Vec<BodyHex>>,
     pub req_body: Option<Body>,
     pub res_body: Option<Body>,
 }
@@ -84,12 +108,59 @@ impl ProxyServer {
 
             match send_result {
                 Ok(_) => {
-                    // 等待服务完全停止
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    // 使用动态方式等待服务停止
+                    let max_wait_time = Duration::from_secs(5); // 最大等待时间
+                    let poll_interval = Duration::from_millis(100); // 轮询间隔
+                    let start_time = std::time::Instant::now();
 
-                    // 清理旧的服务器实例
-                    self.server = None;
+                    // 先将服务实例置为 None，这样弱引用检测才能正常工作
+                    let server_instance = self.server.take();
                     self.current_port = 0;
+
+                    // 如果有服务实例，创建一个弱引用来监控它
+                    if let Some(server_ref) = server_instance {
+                        let weak_server = Arc::downgrade(&server_ref);
+
+                        // 创建一个通知器，用于服务停止时发出信号
+                        let shutdown_complete = Arc::new(tokio::sync::Notify::new());
+                        let shutdown_complete_clone = shutdown_complete.clone();
+
+                        // 启动一个任务来监控服务引用计数
+                        tokio::spawn(async move {
+                            // 定期检查服务是否已被释放
+                            loop {
+                                if weak_server.upgrade().is_none() {
+                                    // 服务已被释放，发出通知
+                                    shutdown_complete_clone.notify_one();
+                                    break;
+                                }
+
+                                // 如果引用计数为1（只有我们自己持有），也可以认为服务已停止
+                                if weak_server.strong_count() <= 1 {
+                                    // 手动释放最后一个引用
+                                    drop(server_ref);
+                                    shutdown_complete_clone.notify_one();
+                                    break;
+                                }
+
+                                tokio::time::sleep(poll_interval).await;
+                            }
+                        });
+
+                        // 等待服务停止或超时
+                        tokio::select! {
+                            _ = shutdown_complete.notified() => {
+                                // 服务已停止
+                                log::debug!("服务已正常停止，耗时: {:?}", start_time.elapsed());
+                            }
+                            _ = tokio::time::sleep(max_wait_time) => {
+                                // 超时
+                                log::warn!("等待服务停止超时，强制清理资源，耗时: {:?}", start_time.elapsed());
+                            }
+                        }
+                    } else {
+                        log::debug!("没有活跃的服务实例需要停止");
+                    }
 
                     Ok(old_state)
                 }
@@ -107,7 +178,6 @@ impl ProxyServer {
             Ok(old_state)
         }
     }
-
     // 启动新服务
     pub async fn start_new_server(
         &mut self,
@@ -150,7 +220,7 @@ impl ProxyServer {
                         .app_log_dir()
                         .expect("Failed to get log directory");
 
-                    println!("Log file path: {:?}", log_dir);
+                    info!("Log file path: {:?}", log_dir);
                 }
 
                 Ok("Success".to_string())
@@ -238,15 +308,26 @@ async fn setting_port(
 
 #[tauri::command]
 async fn change_monitor_traffic(
-    monitor_traffic: bool,
+    monitor_traffic: String,
     proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
 ) -> Result<String, String> {
     let proxy_server = proxy_server.lock().await;
     if let Some(state) = proxy_server.get_state() {
-        state
-            .monitor_traffic
-            .store(monitor_traffic, Ordering::SeqCst);
+        let mut current_monitor_traffic = state.monitor_traffic.lock().await;
+        *current_monitor_traffic = monitor_traffic;
         return Ok("Success".to_string());
+    }
+    Err("Not found state".to_string())
+}
+
+#[tauri::command]
+async fn get_monitor_session_id(
+    proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
+) -> Result<String, String> {
+    let proxy_server = proxy_server.lock().await;
+    if let Some(state) = proxy_server.get_state() {
+        let session_id = state.monitor_traffic.lock().await;
+        return Ok(session_id.to_string());
     }
     Err("Not found state".to_string())
 }
@@ -313,41 +394,39 @@ async fn change_monitor_traffic(
 #[tauri::command]
 async fn get_traffic_detail(
     proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
+    session_id: String,
     id: usize,
 ) -> Result<TrafficDetail, String> {
     let proxy_server = proxy_server.lock().await;
     if let Some(state) = proxy_server.get_state() {
-        // 调用 get_traffic 获取数据
         let traffic = state
-            .get_traffic(id)
+            .get_traffic(id, session_id)
             .await
-            .ok_or_else(|| anyhow!("Not found traffic {id}"))
             .map_err(|e| e.to_string())?;
 
         let (req_body, res_body) = traffic.bodies(false).await;
 
         let traffic_detail = TrafficDetail {
-            traffic: traffic.clone(),
-            req_body: match req_body {
-                Some(body) => {
-                    // 可以在这里添加额外的处理逻辑
-                    Some(body)
-                }
-                None => None,
+            overview: Overview {
+                url: traffic.uri.clone(),
+                method: traffic.method.clone(),
+                code: traffic.status.clone(),
+                status: traffic.transaction_state.clone(),
+                protocol: traffic.http_version.clone(),
+                start_time: traffic.start_time.clone(),
+                end_time: traffic.end_time.clone(),
             },
-            res_body: match res_body {
-                Some(body) => {
-                    // 可以在这里添加额外的处理逻辑
-                    Some(body)
-                }
-                None => None,
-            },
+            req_head_json: traffic.req_head_json(),
+            res_head_json: traffic.res_head_json(),
+            req_body_hex: traffic.req_body_hex.clone(),
+            res_body_hex: traffic.res_body_hex.clone(),
+            req_body,
+            res_body,
         };
         return Ok(traffic_detail);
     }
     Err("Not found state".to_string())
 }
-
 #[tauri::command]
 async fn handle_debugger_command(
     proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
@@ -356,27 +435,10 @@ async fn handle_debugger_command(
     let proxy_server = proxy_server.lock().await;
     if let Some(state) = proxy_server.get_state() {
         match command {
-            DebuggerCommand::UpdateBreakpoint { breakpoints } => {
-                // println!("bp:{:?}", breakpoints);
-                match state.update_breakpoint(breakpoints).await {
-                    Ok(_) => return Ok("Success".to_string()),
-                    Err(_) => return Err("Fail".to_string()),
-                }
-            }
-            DebuggerCommand::RemoveBreakpoint { ids } => {
-                match state.remove_breakpoint(&ids).await {
-                    Ok(_) => return Ok("Success".to_string()),
-                    Err(_) => return Err("Fail".to_string()),
-                }
-            }
             DebuggerCommand::Continue { id } => match state.continue_traffic(&id).await {
                 Ok(_) => return Ok("Success".to_string()),
                 Err(e) => return Err(e.to_string()),
             },
-            DebuggerCommand::ListBreakpoints => {
-                let bp = state.get_breakpoints().await;
-                return Ok(serde_json::to_string(&bp).unwrap());
-            }
             DebuggerCommand::ModifyTraffic(modification) => {
                 match state.modify_paused_traffic(modification).await {
                     Ok(_) => return Ok("Success".to_string()),
@@ -392,6 +454,7 @@ async fn handle_debugger_command(
 #[tauri::command]
 async fn handle_export_traffic(
     proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
+    session_id: String,
     path: String,
 ) -> Result<String, String> {
     let proxy_server = proxy_server.lock().await;
@@ -409,7 +472,7 @@ async fn handle_export_traffic(
             .unwrap_or("txt")
             .to_string();
         let (content, _) = state
-            .export_all_traffics(&format)
+            .export_all_traffics(&format, session_id)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -431,11 +494,12 @@ async fn handle_copy_traffic(
     proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
     id: usize,
     format: String,
+    session_id: String,
 ) -> Result<String, String> {
     let proxy_server = proxy_server.lock().await;
     if let Some(state) = proxy_server.get_state() {
         let (data, _) = state
-            .export_traffic(id, &format)
+            .export_traffic(id, &format, session_id)
             .await
             .map_err(|e| format!("Failed to copy traffic: {}", e))?;
 
@@ -467,7 +531,7 @@ async fn open_config_dir(
 #[tauri::command]
 async fn import_session(
     proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
-    app_handle: tauri::AppHandle,
+    session_id: String,
     path: String,
 ) -> Result<Vec<TrafficHead>, String> {
     let proxy_server = proxy_server.lock().await;
@@ -486,47 +550,137 @@ async fn import_session(
         let traffic_array: Vec<Traffic> = serde_json::from_str(&file_content)
             .map_err(|e| format!("Failed to parse JSON: {}", e))?;
 
-        let state_tmp: Arc<TrafficState> =
-            Arc::new(TrafficState::new(PrintMode::Oneline, app_handle));
         let mut result_array = Vec::new();
+
+        // 获取session的写锁
+        let mut sessions = state.session.write().await;
+
+        // 确保会话存在
+        if !sessions.contains_key(&session_id) {
+            sessions.insert(session_id.clone(), Mutex::new(IndexMap::new()));
+        }
+
+        // 获取指定会话的锁
+        let session_traffics = sessions.get(&session_id).unwrap();
+        let mut session_traffics_locked = session_traffics.lock().await;
 
         // 处理每个 Traffic 对象
         for mut traffic in traffic_array {
             traffic.valid = true;
-            match state_tmp.add_traffic(traffic).await {
-                Ok(t) => {
-                    result_array.push(t);
-                }
-                Err(e) => {
-                    eprintln!("Failed to add traffic: {}", e);
-                }
-            }
+            let id = session_traffics_locked.len() + 1;
+            let head = traffic.head(id, session_id.to_string());
+            session_traffics_locked.insert(id, Arc::new(traffic));
+            result_array.push(head);
         }
-
-        let mut traffics = state.traffics.lock().await;
-        {
-            let tmp_traffics = state_tmp.traffics.lock().await;
-            *traffics = tmp_traffics.clone();
-        }
-        drop(state_tmp);
-        Ok(result_array)
+        return Ok(result_array);
     } else {
         Err("Not found state".to_string())
     }
 }
 
 #[tauri::command]
-async fn get_traffics(
+async fn import_har(
     proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
-) -> Result<IndexMap<usize, Traffic>, String> {
+    session_id: String,
+    path: String,
+) -> Result<Vec<TrafficHead>, String> {
     let proxy_server = proxy_server.lock().await;
     if let Some(state) = proxy_server.get_state() {
-        let traffics = state.traffics.lock().await;
-        Ok(traffics.clone())
+        let file_path = std::path::Path::new(&path);
+
+        if !file_path.exists() {
+            return Err("HAR 文件不存在".to_string());
+        }
+
+        // 读取HAR文件内容
+        let file_content = tokio::fs::read_to_string(file_path)
+            .await
+            .map_err(|e| format!("读取文件失败: {}", e))?;
+
+        // 解析HAR文件
+        let har: serde_json::Value =
+            serde_json::from_str(&file_content).map_err(|e| format!("解析HAR JSON失败: {}", e))?;
+
+        if let Some(server) = &proxy_server.server {
+            Ok(state
+                .import_har(har, server, session_id)
+                .await
+                .map_err(|e| e.to_string())?)
+        } else {
+            Err("Not found server".to_string())
+        }
     } else {
-        Err("Not found state".to_string())
+        Err("未找到状态".to_string())
     }
 }
+
+#[tauri::command]
+async fn import_charles(
+    proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
+    app_handle: tauri::AppHandle,
+    session_id: String,
+    path: String,
+) -> Result<Vec<TrafficHead>, String> {
+    let file_path = std::path::Path::new(&path);
+
+    if !file_path.exists() {
+        return Err(format!("chls 文件不存在, file_path:{:#?}", file_path));
+    }
+    let file_name = file_path
+        .file_name()
+        .unwrap_or_default()
+        .to_str()
+        .unwrap_or("");
+
+    // 创建 StoreBuilder 实例
+    let store = StoreBuilder::new(&app_handle, PathBuf::from("settings.json"))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    // 获取 charlesPath
+    if let Some(charles_path) = store.get("charlesPath") {
+        if let Some(charles_path_str) = charles_path.as_str() {
+            let charles_converter =
+                CharlesConverter::new(charles_path_str).map_err(|err| err.to_string())?;
+            let path_resolver = app_handle.path();
+            let temp_dir = path_resolver.temp_dir().map_err(|e| e.to_string())?;
+            let output_filename = {
+                let parts: Vec<&str> = file_name.split('.').collect();
+                if !parts.is_empty() {
+                    format!("{}.har", parts[parts.len() - 2])
+                } else {
+                    "output.har".to_string()
+                }
+            };
+
+            let output_path: PathBuf = temp_dir.join(output_filename);
+            if output_path.exists() {
+                fs::remove_file(&output_path).map_err(|e| e.to_string())?;
+            }
+            let har_path = charles_converter
+                .convert_to_har(&path, output_path.to_str())
+                .map_err(|e| e.to_string())?;
+            let result = import_har(
+                proxy_server,
+                session_id,
+                har_path.to_str().unwrap().to_string(),
+            )
+            .await;
+            // 清理临时文件
+            if let Err(e) = fs::remove_file(&har_path) {
+                eprintln!("Failed to remove temporary file: {}", e);
+            }
+            if let Ok(res) = result {
+                return Ok(res);
+            } else {
+                return Err(result.unwrap_err());
+            }
+        }
+    }
+
+    Err("Charles 路径未找到".to_string()) // 如果没有找到 charlesPath，返回错误
+}
+
 fn get_log_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, tauri::Error> {
     Ok(app_handle.path().app_log_dir()?)
 }
@@ -597,6 +751,60 @@ async fn on_resend(
     }
 }
 
+#[tauri::command]
+async fn search(
+    data: SearchQuery,
+    session_id: String,
+    proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
+) -> Result<SearchResult, String> {
+    let proxy_server = proxy_server.lock().await;
+    if let Some(state) = proxy_server.get_state() {
+        let text = data.text.clone();
+        match state.search_traffic(data, session_id).await {
+            Ok(search_result) => {
+                return Ok(SearchResult {
+                    text,
+                    search_data: search_result,
+                });
+            }
+            Err(_) => {
+                return Err("Search traffic failed".to_string());
+            }
+        }
+    } else {
+        Err("Not found state".to_string())
+    }
+}
+
+#[tauri::command]
+async fn delete_traffic(
+    proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
+    session_id: String,
+    ids: Vec<usize>,
+) -> Result<String, String> {
+    let proxy_server = proxy_server.lock().await;
+    if let Some(state) = proxy_server.get_state() {
+        for id in ids {
+            state
+                .delete_traffic(id, &session_id)
+                .await
+                .expect("delete traffic failed");
+        }
+        return Ok("Success".to_string());
+    }
+    Err("Not found state".to_string())
+}
+
+#[tauri::command]
+async fn is_charles_running() -> bool {
+    charles::is_charles_running()
+}
+
+#[tauri::command]
+async fn kill_charles() -> Result<bool, String> {
+    charles::kill_charles_async().await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run(ca: CertificateAuthority, config_dir: PathBuf) {
     let date = Local::now();
@@ -613,7 +821,7 @@ pub fn run(ca: CertificateAuthority, config_dir: PathBuf) {
         // .plugin(tauri_plugin_log::Builder::new().build())
         .setup(|app| {
             let path: PathBuf = PathBuf::from("settings.json");
-            let store = StoreBuilder::new(app.handle(), path).build()?; // 使用 ? 解包 Result
+            let store = StoreBuilder::new(app.handle(), path).build()?;
 
             if store.get("externalProxy").is_none() {
                 let initial_config = ExternalProxy::new();
@@ -672,11 +880,17 @@ pub fn run(ca: CertificateAuthority, config_dir: PathBuf) {
             open_config_dir,
             setting_port,
             import_session,
+            import_har,
+            import_charles,
             change_monitor_traffic,
-            get_traffics,
+            get_monitor_session_id,
             get_log_path,
             resend,
-            on_resend
+            on_resend,
+            search,
+            delete_traffic,
+            is_charles_running,
+            kill_charles
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

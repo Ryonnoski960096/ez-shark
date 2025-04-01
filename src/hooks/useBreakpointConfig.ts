@@ -1,6 +1,7 @@
 import { useSettingStore } from "@/stores/settings";
 import { createXmlStr, readXmlFile } from "@/utils/file";
 import { exists, writeTextFile } from "@tauri-apps/plugin-fs";
+import { error } from "@tauri-apps/plugin-log";
 import { message } from "ant-design-vue";
 import { computed } from "vue";
 
@@ -9,7 +10,7 @@ interface Request {
   body: string;
 }
 
-interface Response extends Request {}
+type Response = Request;
 
 export type Method = "GET" | "POST" | "PUT" | "DELETE";
 
@@ -65,7 +66,7 @@ export default function useBreakpointConfig() {
     const breakpoints: Breakpoint | Breakpoint[] =
       xmlObj.breakpoints.breakpoints.breakpoint;
 
-    let breakpointList: Breakpoint[] = Array.isArray(breakpoints)
+    const breakpointList: Breakpoint[] = Array.isArray(breakpoints)
       ? breakpoints
       : [breakpoints];
 
@@ -75,7 +76,7 @@ export default function useBreakpointConfig() {
       breakpointRecord[id] = { ...bp, id };
     });
 
-    const hide = message.loading("导入配置中...");
+    const hide = message.loading("导入配置中...", 0);
 
     await handler({
       toolEnabled: xmlObj.breakpoints.toolEnabled,
@@ -102,14 +103,14 @@ export default function useBreakpointConfig() {
 
     try {
       if (savePath) {
-        const hide = message.loading("导出配置中...");
+        const hide = message.loading("导出配置中...", 0);
         await writeTextFile(savePath, createXmlStr(xmlObj));
         hide();
         message.success("导出配置成功");
       }
-    } catch (error) {
+    } catch (e) {
       message.error("导出配置失败");
-      console.error(error);
+      error("导出配置失败" + e);
     }
   };
 

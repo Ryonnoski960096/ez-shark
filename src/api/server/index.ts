@@ -1,5 +1,5 @@
 import { useIpc } from "@/hooks";
-import { Response } from "../model";
+import type { Response } from "../model";
 
 const ipc = useIpc();
 
@@ -20,9 +20,14 @@ export function setPort(port: number): Promise<Response> {
  * @returns
  */
 export function changeMonitorTraffic(
-  monitorTraffic: boolean
+  monitorTraffic: string
 ): Promise<Response> {
   return ipc.invoke("change_monitor_traffic", {
     monitorTraffic
   });
+}
+
+// 获取当前监听的session id
+export function getCurrentListenSessionID(): Promise<string | "Fail"> {
+  return ipc.invoke("get_monitor_session_id");
 }

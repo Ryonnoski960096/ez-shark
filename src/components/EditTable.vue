@@ -3,7 +3,7 @@
     <el-table
       style="width: 100%"
       ref="tableRef"
-      v-bind="tableOps"
+      v-bind="combinedTableProps"
       :data="dataSource"
       show-overflow-tooltip
       @row-dblclick="handleRowDblClick"
@@ -101,7 +101,7 @@
 </template>
 
 <script setup lang="ts">
-import { h, nextTick, ref } from "vue";
+import { computed, h, nextTick, ref } from "vue";
 import {
   ElTable,
   ElTableColumn,
@@ -109,9 +109,9 @@ import {
   ElButton,
   ElButtonGroup
 } from "element-plus";
-import { tableOps, type DataItem } from "@/window/breakpoint/pause/edit/model";
+import { tableOps, type DataItem } from "@/components/contents/model";
 import ContextMenu from "@imengyu/vue3-context-menu";
-import { IHeaderItem } from "@/stores/traffic";
+import type { IHeaderItem } from "@/stores/traffic";
 
 defineOptions({ name: "EditHeader" });
 
@@ -124,6 +124,47 @@ const { readOnly = false } = defineProps<{
   readOnly?: boolean;
 }>();
 
+const readOnlyBindings = computed(() => {
+  return readOnly
+    ? {
+        contenteditable: "true",
+        onInput: (e: Event) => e.preventDefault(),
+        onBeforeinput: (e: Event) => e.preventDefault(),
+        onPaste: (e: Event) => e.preventDefault(),
+        onKeydown: (e: KeyboardEvent) => {
+          // 精细控制允许的按键
+          const allowedKeys = [
+            "ArrowUp",
+            "ArrowDown",
+            "ArrowLeft",
+            "ArrowRight",
+            "Home",
+            "End",
+            "PageUp",
+            "PageDown"
+          ];
+
+          // 允许选择和复制相关的组合键
+          const isSelectOrCopyAllowed = (e: KeyboardEvent) => {
+            return (
+              (e.ctrlKey || e.metaKey) &&
+              ["a", "c", "x"].includes(e.key.toLowerCase())
+            );
+          };
+
+          // 阻止所有编辑操作
+          if (!allowedKeys.includes(e.key) && !isSelectOrCopyAllowed(e)) {
+            e.preventDefault();
+          }
+        }
+      }
+    : {};
+});
+
+const combinedTableProps = computed(() => ({
+  ...tableOps,
+  ...readOnlyBindings.value
+}));
 // 表格和编辑状态
 const tableRef = ref<InstanceType<typeof ElTable>>();
 const editingIndex = ref(-1);

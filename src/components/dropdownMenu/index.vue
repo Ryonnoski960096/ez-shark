@@ -26,7 +26,7 @@ import {
   ElDropdownItem,
   ElLink
 } from "element-plus";
-import { MenuItem } from "./model";
+import type { MenuItem } from "./model";
 
 const props = defineProps<{
   title: string;

@@ -43,11 +43,22 @@ export const getStatusText = (code: number | undefined | null): string => {
   return statusTexts[code ?? 0] || "Unknown Status";
 };
 
-export const statusIndicator = (code: number | undefined | null) => `
+export const statusIndicator = (code: number | string | undefined | null) => {
+  if (
+    code === undefined ||
+    code === null ||
+    code === "null" ||
+    code === "undefined"
+  ) {
+    return "";
+  }
+  if (typeof code === "string") code = parseInt(code);
+  return `
   <span 
     style="
-      color:${getColorByStatus(code ?? 0)};
+      color:${getColorByStatus(code)};
       font-weight:500;
       cursor:help;
       "
-    title="${getStatusText(code)}">${code ?? ""}</span>`;
+    title="${getStatusText(code)}">${code}</span>`;
+};

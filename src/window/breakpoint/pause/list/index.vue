@@ -29,7 +29,7 @@
 </template>
 
 <script setup lang="ts">
-import { TrafficEditData } from "@/stores/traffic";
+import type { TrafficEditData } from "@/stores/traffic";
 import { ref, watch } from "vue";
 
 // 定义 props

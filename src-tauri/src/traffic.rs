@@ -24,14 +24,20 @@ pub enum TransactionState {
     Aborted,      // 中止
 }
 
-// fn hex_to_string(hex_str: &str) -> String {
-//     let bytes = (0..hex_str.len())
-//         .step_by(2)
-//         .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16).unwrap())
-//         .collect::<Vec<u8>>(); // 将每两个字符转为一个字节
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SearchQuery {
+    pub text: String,
+    pub position: SearchQueryPosition,
+}
 
-//     String::from_utf8(bytes).unwrap_or_else(|_| String::from("Invalid UTF-8")) // 转为字符串
-// }
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SearchQueryPosition {
+    pub request_url: bool,
+    pub request_header: bool,
+    pub request_body: bool,
+    pub response_header: bool,
+    pub response_body: bool,
+}
 
 pub fn bytes_to_hex_structs(bytes: &Bytes) -> Vec<BodyHex> {
     let mut result = Vec::new();
@@ -98,6 +104,42 @@ impl BodyHex {
     }
 }
 
+pub fn string_to_body_hex(s: &str) -> Vec<BodyHex> {
+    let bytes = s.as_bytes();
+    let mut result = Vec::new();
+    let mut current_offset: u64 = 0;
+
+    // 每16字节为一组进行处理
+    for chunk in bytes.chunks(16) {
+        // 将当前块转换为Vec<u8>
+        let hex_values: Vec<u8> = chunk.to_vec();
+
+        // 创建新的BodyHex实例
+        let body_hex = BodyHex {
+            offset_address: current_offset,
+            hex: hex_values.clone(),
+            character_view: hex_values
+                .iter()
+                .map(|&byte| {
+                    if byte >= 0x20 && byte <= 0x7E {
+                        byte as char
+                    } else {
+                        ' '
+                    }
+                })
+                .collect::<String>(),
+        };
+
+        // 添加到结果数组
+        result.push(body_hex);
+
+        // 增加偏移地址，每次加16
+        current_offset += 16;
+    }
+
+    result
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Traffic {
     pub gid: usize,
@@ -151,6 +193,20 @@ impl Traffic {
             error: None,
             valid: true,
         }
+    }
+
+    pub fn req_head_json(&self) -> Option<String> {
+        if let Some(headers) = &self.req_headers {
+            return Some(headers.to_json());
+        }
+        None
+    }
+
+    pub fn res_head_json(&self) -> Option<String> {
+        if let Some(headers) = &self.res_headers {
+            return Some(headers.to_json());
+        }
+        None
     }
 
     pub fn add_error(&mut self, error: String) {
@@ -320,7 +376,7 @@ impl Traffic {
         }
     }
 
-    pub(crate) fn head(&self, id: usize) -> TrafficHead {
+    pub(crate) fn head(&self, id: usize, session_id: String) -> TrafficHead {
         TrafficHead {
             id,
             method: self.method.clone(),
@@ -332,6 +388,7 @@ impl Traffic {
             transaction_state: self.transaction_state.clone(),
             start_time: self.start_time,
             websocket_id: self.websocket_id,
+            session_id,
         }
     }
 
@@ -379,10 +436,10 @@ impl Traffic {
         self
     }
 
-    pub(crate) fn set_websocket_id(&mut self, id: usize) -> &mut Self {
-        self.websocket_id = Some(id);
-        self
-    }
+    // pub(crate) fn set_websocket_id(&mut self, id: usize) -> &mut Self {
+    //     self.websocket_id = Some(id);
+    //     self
+    // }
 
     // pub(crate) fn check_match(&mut self, is_match: bool) -> &mut Self {
     //     self.valid = self.valid && is_match;
@@ -448,6 +505,7 @@ pub struct TrafficHead {
     pub transaction_state: TransactionState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub websocket_id: Option<usize>,
+    pub session_id: String,
 }
 
 impl TrafficHead {
@@ -478,6 +536,61 @@ impl Headers {
             items: map_headers(headers),
             size: cal_headers_size(headers),
         }
+    }
+
+    pub fn to_json(&self) -> String {
+        let mut json_str = String::from("{\n");
+        let mut cookies = Vec::new();
+        let mut first_item = true; // 用于跟踪是否是第一个项
+
+        for item in &self.items {
+            // 检查是否为 cookie 项
+            if item.name == "cookie" {
+                // 处理 cookie 以便于合并
+                let value = item.value.replace("\"", "\\\""); // 处理 cookie 中的引号
+                cookies.push(value); // 将 cookie 值添加到数组中
+            } else {
+                // 处理引号
+                let value = item
+                    .value
+                    .replace("\"", "\\\"") // 处理引号
+                    .replace("\\\\", "\\"); // 确保在需要的时候正确处理反斜杠
+
+                // 确保值的格式
+                // 如果值是数字或布尔值，则不加引号；否则，加引号
+                let formatted_value = if value.parse::<f64>().is_ok()
+                    || value == "true"
+                    || value == "false"
+                    || value == "null"
+                {
+                    value // 是数字或布尔值，直接使用
+                } else {
+                    // 是字符串，加引号
+                    format!("\"{}\"", value)
+                };
+
+                // 在第一个项前不添加逗号
+                if !first_item {
+                    json_str.push_str(",\n"); // 如果前面不是第一个项，添加逗号
+                }
+                first_item = false; // 后续项设置为非首项
+
+                json_str.push_str(&format!("  \"{}\": {}", item.name, formatted_value));
+            }
+        }
+
+        // 合并所有 cookie 值
+        if !cookies.is_empty() {
+            let combined_cookies = cookies.join(";"); // 合并 cookie
+            if !first_item {
+                json_str.push_str(",\n"); // 添加逗号
+            }
+
+            json_str.push_str(&format!("  \"cookie\": \"{}\"", combined_cookies));
+        }
+
+        json_str.push_str("\n}"); // 结束大括号
+        json_str
     }
 }
 
@@ -538,13 +651,15 @@ impl Body {
                             if text.is_empty() {
                                 return None;
                             }
-                            Self::text(&text)
+                            let data = tokio::fs::read(path).await.ok()?;
+                            Self::bytes(&data)
                         }
                         Err(err) => {
                             if err.kind() != std::io::ErrorKind::InvalidData {
                                 return None;
                             } else {
-                                Self::path(path)
+                                let data = tokio::fs::read(path).await.ok()?;
+                                Self::bytes(&data)
                             }
                         }
                     }
@@ -560,7 +675,7 @@ impl Body {
             Ok(text) => Self::text(text),
             Err(_) => Body {
                 encode: "base64".to_string(),
-                value: base64_encode(data),
+                value: add_data_url_prefix(&base64_encode(data)),
                 size: size as _,
             },
         }
@@ -760,7 +875,7 @@ pub(crate) fn wrap_entries(entries: Vec<Value>) -> Value {
         "log": {
             "version": "1.2",
             "creator": {
-                "name": "proxyfor",
+                "name": "ez-shark",
                 "version": env!("CARGO_PKG_VERSION"),
                 "comment": "",
             },

@@ -1,7 +1,7 @@
 // 断点API
 
 import { useIpc } from "@/hooks";
-import { Response } from "../model";
+import type { Response } from "../model";
 
 const ipc = useIpc();
 

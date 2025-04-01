@@ -1,3 +1,4 @@
+pub mod charles;
 pub mod crypto;
 pub mod external_proxy;
 

@@ -4,19 +4,19 @@
 // extern crate log;
 
 use anyhow::{anyhow, Result};
-use ezshark_lib::cert::{init_ca, CertificateAuthority};
+use ez_shark_lib::cert::{init_ca, CertificateAuthority};
 use log::debug;
-use simplelog::{
-    format_description, ColorChoice, CombinedLogger, ConfigBuilder, LevelFilter, TermLogger,
-    TerminalMode, WriteLogger,
-};
+// use simplelog::{
+//     format_description, ColorChoice, CombinedLogger, ConfigBuilder, LevelFilter, TermLogger,
+//     TerminalMode, WriteLogger,
+// };
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
-const CA_CERT_FILENAME: &str = "ezshark-ca-cert.cer";
-const PRIVATE_KEY_FILENAME: &str = "ezshark-key.pem";
+const CA_CERT_FILENAME: &str = "ez-shark-ca-cert.cer";
+const PRIVATE_KEY_FILENAME: &str = "ez-shark-key.pem";
 
 // todo 去除全局的unwrap 改为在界面报错
 #[tokio::main]
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     // let stop_server = server.run(listener).await?;
     // info!("HTTP(S) proxy listening at {ip}:{port}");
 
-    ezshark_lib::run(ca, config_dir.join(CA_CERT_FILENAME));
+    ez_shark_lib::run(ca, config_dir.join(CA_CERT_FILENAME));
     // if is_tui {
     //     let addr = addr.clone();
     //     tui::run(state, &addr).await.context("Failed to run TUI")?;
@@ -93,28 +93,28 @@ fn setup_ca(config_dir: &Path) -> Result<CertificateAuthority> {
     let ca = init_ca(&ca_cert_file, &private_key_file)?;
     Ok(ca)
 }
-fn setup_logger(config_dir: &Path) -> Result<()> {
-    let log_level = if cfg!(debug_assertions) {
-        LevelFilter::Debug
-    } else {
-        LevelFilter::Info
-    };
-    let crate_name = env!("CARGO_CRATE_NAME");
-    let config = ConfigBuilder::new()
-        .add_filter_allow(crate_name.to_string())
-        .set_time_format_custom(format_description!(
-            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
-        ))
-        .set_thread_level(LevelFilter::Off)
-        .build();
-    let log_path = config_dir.join(format!("{crate_name}.log"));
-    let log_file = fs::File::create(log_path)?;
-    CombinedLogger::init(vec![
-        WriteLogger::new(log_level, config.clone(), log_file),
-        TermLogger::new(log_level, config, TerminalMode::Mixed, ColorChoice::Auto),
-    ])?;
-    Ok(())
-}
+// fn setup_logger(config_dir: &Path) -> Result<()> {
+//     let log_level = if cfg!(debug_assertions) {
+//         LevelFilter::Debug
+//     } else {
+//         LevelFilter::Info
+//     };
+//     let crate_name = env!("CARGO_CRATE_NAME");
+//     let config = ConfigBuilder::new()
+//         .add_filter_allow(crate_name.to_string())
+//         .set_time_format_custom(format_description!(
+//             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+//         ))
+//         .set_thread_level(LevelFilter::Off)
+//         .build();
+//     let log_path = config_dir.join(format!("{crate_name}.log"));
+//     let log_file = fs::File::create(log_path)?;
+//     CombinedLogger::init(vec![
+//         WriteLogger::new(log_level, config.clone(), log_file),
+//         TermLogger::new(log_level, config, TerminalMode::Mixed, ColorChoice::Auto),
+//     ])?;
+//     Ok(())
+// }
 
 fn ensure_config_dir(dir_name: &str) -> Result<PathBuf> {
     let mut config_dir = dirs::home_dir().ok_or_else(|| anyhow!("No home dir"))?;
@@ -130,8 +130,8 @@ fn ensure_config_dir(dir_name: &str) -> Result<PathBuf> {
     Ok(config_dir)
 }
 
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install CTRL+C signal handler")
-}
+// async fn shutdown_signal() {
+//     tokio::signal::ctrl_c()
+//         .await
+//         .expect("Failed to install CTRL+C signal handler")
+// }

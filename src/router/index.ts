@@ -1,12 +1,18 @@
 import { createWebHistory, createRouter } from "vue-router";
 import Home from "@/window/index.vue";
-import { breakpointRoute, settingRoute, externalProxyRoute } from "./routes";
+import {
+  breakpointRoute,
+  settingRoute,
+  externalProxyRoute,
+  searchRoute
+} from "./routes";
 
 const routes = [
   { path: "/", component: Home },
   ...breakpointRoute,
   ...settingRoute,
-  ...externalProxyRoute
+  ...externalProxyRoute,
+  ...searchRoute
 ];
 
 const router = createRouter({

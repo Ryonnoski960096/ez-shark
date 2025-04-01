@@ -1,19 +1,22 @@
 <template>
   <VirtualTable
+    ref="virtualTableRef"
     table-id="trafficList"
     :data="tableData"
-    :active="trafficStore.currentTrafficId"
+    :active="currentTrafficId"
     :columns="columns"
     :row-height="28"
+    v-model:ids="ids"
     @onCellClick="onCellClick"
     @onContextMenu="oncontextmenu"
   />
 </template>
 
 <script setup lang="ts">
-import { computed, watch } from "vue";
+import { ref, useTemplateRef, watch } from "vue";
 import ContextMenu from "@imengyu/vue3-context-menu";
-import { TrafficData, useTrafficStore } from "@/stores/traffic";
+import type { TrafficData, TransactionState } from "@/stores/traffic";
+import { useTrafficStore } from "@/stores/traffic";
 import { useBreakpointConfig } from "@/hooks";
 import { useEventBus } from "@/hooks";
 import {
@@ -24,17 +27,50 @@ import {
 } from "@/utils/format";
 import VirtualTable from "@/components/VirtualTable.vue";
 import { useSettingStore } from "@/stores/settings";
-import { Breakpoint, Breakpoints, Method } from "@/hooks/useBreakpointConfig";
-import { Store } from "@tauri-apps/plugin-store";
-import { updateBreakpoint } from "@/api/breakpoint";
-import { queryTrafficDetail, resend } from "@/api/traffic";
+import type {
+  Breakpoint,
+  Breakpoints,
+  Method
+} from "@/hooks/useBreakpointConfig";
+import type { Store } from "@tauri-apps/plugin-store";
+import { deleteTraffic, queryTrafficDetail, resend } from "@/api/traffic";
 import { copyContent } from "@/utils/tools";
 import { copyApi } from "@/api/export";
 import { statusIndicator } from "./statusIndicator";
+import { message } from "ant-design-vue";
+import { error } from "@tauri-apps/plugin-log";
+import { useSessionStore } from "@/stores/session";
+
+const settingStore = useSettingStore();
+const breakpointStore = useBreakpointConfig();
+const sessionStore = useSessionStore();
+const trafficStore = useTrafficStore();
+const virtualTableRef =
+  useTemplateRef<InstanceType<typeof VirtualTable>>("virtualTableRef");
 
 defineOptions({
   name: "TrafficList"
 });
+
+const ids = ref<Set<number>>(new Set());
+
+const currentTrafficId = ref<number | null>(null);
+
+watch(
+  [() => sessionStore.currentSession, () => trafficStore.currentTrafficId],
+  () => {
+    if (!sessionStore.currentSession) {
+      currentTrafficId.value = null;
+      return;
+    }
+    const trafficId = trafficStore.currentTrafficId.get(
+      sessionStore.currentSession
+    );
+
+    currentTrafficId.value = trafficId || null;
+  },
+  { deep: 2 }
+);
 
 // 定义列配置
 const columns = [
@@ -78,7 +114,18 @@ const columns = [
     title: "Size",
     width: 10,
     minWidth: 10,
-    formatter: (value: number) => formatFileSize(value ?? 0)
+    formatter: (value: number | string | undefined | null) => {
+      // 处理 undefined 和 null 的情况
+      if (value === undefined || value === null) {
+        return formatFileSize(0);
+      }
+
+      // 转换为数字，确保非 0
+      value = Number(value);
+
+      // 如果转换后是 NaN，返回 0
+      return formatFileSize(isNaN(value) ? 0 : value);
+    }
   },
   {
     key: "transaction_state",
@@ -86,27 +133,54 @@ const columns = [
     width: 15
   }
 ];
+interface TableRowData {
+  id: number;
+  method: string;
+  mime: string;
+  size: number | null;
+  status: number;
+  time: number | null;
+  transaction_state: TransactionState;
+  start_time: string | null;
+  session_id: string;
+  host: string;
+  path: string;
+  onClick: () => void;
+}
 
-// 计算表格数据
-const tableData = computed(() => {
-  const list = trafficStore.isSearchMode
-    ? trafficStore.searchMode
-    : trafficStore.trafficList;
+const tableData = ref<TableRowData[]>([]);
 
-  return Array.from(list.values()).map(({ uri, ...rest }) => {
-    const { host, path } = parseUrlToHostPath(uri, rest.method === "CONNECT");
+watch(
+  [() => trafficStore.trafficList, () => sessionStore.currentSession],
+  () => {
+    const list = trafficStore.isSearchMode
+      ? trafficStore.searchMode
+      : trafficStore.trafficList;
 
-    return {
-      ...rest,
-      host: host,
-      path: path,
-      onClick: () => handleRowClick(rest.id)
-    };
-  });
-});
+    if (!sessionStore.currentSession) return;
 
-const settingStore = useSettingStore();
-const breakpointStore = useBreakpointConfig();
+    const traffics = list.get(sessionStore.currentSession);
+
+    if (!traffics) {
+      tableData.value = [];
+      return;
+    }
+
+    tableData.value = Array.from(traffics.values()).map(({ uri, ...rest }) => {
+      const { host, path } = parseUrlToHostPath(uri, rest.method === "CONNECT");
+      return {
+        ...rest,
+        host: host,
+        path: decodeURIComponent(path),
+        onClick: () => handleRowClick(rest.id)
+      };
+    });
+  },
+  {
+    immediate: true,
+    deep: 3
+  }
+);
 
 /**
  * 添加断点
@@ -116,7 +190,7 @@ const addBreakpoint = async (traffic: TrafficData) => {
   const breakpoint: Breakpoint = {
     enabled: true,
     conditions: {
-      url: traffic.uri,
+      url: traffic.host + "" + traffic.path,
       method: traffic.method as Method,
       req_enable: true,
       res_enable: true,
@@ -143,27 +217,128 @@ const addBreakpoint = async (traffic: TrafficData) => {
   breakpoints.breakpoints[key] = b;
 
   settingStore.set("breakpoints", breakpoints);
-
-  const breakpointLists = [];
-  for (const key in breakpoints.breakpoints) {
-    breakpointLists.push(breakpoints.breakpoints[key]);
-  }
-
-  await updateBreakpoint(breakpointLists);
 };
 
-function oncontextmenu(e: MouseEvent, traffic: TrafficData) {
+/**
+ * 验证流量是否已添加断点
+ * @param traffic 流量数据
+ * @returns 是否已添加断点
+ */
+const isTrafficBreakpointAdded = async (
+  traffic: TrafficData
+): Promise<boolean> => {
+  // 如果设置存储为空，直接返回 false
+  if ((await settingStore.store) === null) return false;
+
+  // 获取断点列表
+  const breakpointList: Breakpoints | null | undefined = await (
+    (await settingStore.store) as Store
+  ).get("breakpoints");
+
+  // 如果没有断点列表，返回 false
+  if (!breakpointList || !breakpointList.breakpoints) return false;
+
+  // 遍历现有断点
+  return Object.values(breakpointList.breakpoints).some(
+    (breakpoint) =>
+      breakpoint.conditions.url === (traffic.host ?? "") + traffic.path &&
+      breakpoint.conditions.method === traffic.method
+  );
+};
+
+/**
+ * 删除匹配的断点
+ * @param traffic 流量数据
+ * @returns 是否成功删除断点
+ */
+const removeBreakpoint = async (traffic: TrafficData): Promise<boolean> => {
+  // 如果设置存储为空，直接返回 false
+  if ((await settingStore.store) === null) return false;
+
+  // 获取断点列表
+  const breakpointList: Breakpoints | null | undefined = await (
+    (await settingStore.store) as Store
+  ).get("breakpoints");
+
+  // 如果没有断点列表，返回 false
+  if (!breakpointList || !breakpointList.breakpoints) return false;
+
+  // 找到匹配的断点 key
+  const matchedBreakpointKeys = Object.entries(breakpointList.breakpoints)
+    .filter(
+      ([, breakpoint]) =>
+        breakpoint.conditions.url === (traffic.host ?? "") + traffic.path &&
+        breakpoint.conditions.method === traffic.method
+    )
+    .map(([key]) => key);
+
+  // 如果没有匹配的断点，返回 false
+  if (matchedBreakpointKeys.length === 0) return false;
+
+  // 删除匹配的断点
+  matchedBreakpointKeys.forEach((key) => {
+    delete breakpointList.breakpoints[key];
+  });
+
+  // 更新断点列表
+  await settingStore.set("breakpoints", breakpointList);
+
+  return true;
+};
+
+async function oncontextmenu(e: MouseEvent, traffic: TrafficData) {
   e.preventDefault();
-  trafficStore.currentTrafficId = traffic.id;
+  if (ids.value.size !== 0) {
+    ContextMenu.showContextMenu({
+      x: e.x,
+      y: e.y,
+      items: [
+        {
+          label: "Delete Selected",
+          onClick: async () => {
+            try {
+              if (!sessionStore.currentSession) return;
+
+              const currentSessionTraffics = trafficStore.trafficList.get(
+                sessionStore.currentSession
+              );
+              if (!currentSessionTraffics) return;
+              await deleteTraffic([...ids.value]);
+
+              ids.value.forEach((id) => {
+                currentSessionTraffics.delete(id);
+              });
+              ids.value.clear();
+              trafficStore.currentTrafficId.set(
+                sessionStore.currentSession,
+                currentSessionTraffics.keys().next().value ?? 0
+              );
+              message.success("删除成功");
+            } catch (e) {
+              error("删除失败：" + e);
+              message.error("删除失败");
+            }
+          }
+        }
+      ]
+    });
+    return;
+  }
+  if (!sessionStore.currentSession) return;
+
+  trafficStore.currentTrafficId.set(sessionStore.currentSession, traffic.id);
 
   const id = traffic.id;
+  const isAdded = await isTrafficBreakpointAdded(traffic);
+
   ContextMenu.showContextMenu({
     x: e.x,
     y: e.y,
     items: [
       {
-        label: "Breakpoint",
-        onClick: () => addBreakpoint(traffic)
+        label: `${isAdded ? "√ " : ""}Breakpoint`,
+        onClick: () =>
+          isAdded ? removeBreakpoint(traffic) : addBreakpoint(traffic)
       },
       {
         label: "Resend",
@@ -174,8 +349,30 @@ function oncontextmenu(e: MouseEvent, traffic: TrafficData) {
       {
         label: "Copy URL",
         onClick: () => {
-          let text = (traffic.host ?? "") + traffic.path;
+          const text = (traffic.host ?? "") + traffic.path;
           copyContent(text);
+        }
+      },
+      {
+        label: "Delete",
+        onClick: async () => {
+          try {
+            if (!sessionStore.currentSession) return;
+
+            const currentSessionTraffics = trafficStore.trafficList.get(
+              sessionStore.currentSession
+            );
+            if (!currentSessionTraffics) return;
+            await deleteTraffic([id]);
+            currentSessionTraffics.delete(id);
+            trafficStore.currentTrafficId.set(
+              sessionStore.currentSession,
+              currentSessionTraffics.keys().next().value ?? 0
+            );
+          } catch (e) {
+            error("删除失败：" + e);
+            message.error("删除失败");
+          }
         }
       },
       {
@@ -217,36 +414,51 @@ function oncontextmenu(e: MouseEvent, traffic: TrafficData) {
   });
 }
 
-const onCellClick = (item: any) => {
-  trafficStore.currentTrafficId = item.id;
-};
 function handleRowClick(id: number) {
-  trafficStore.currentTrafficId = id;
-}
+  if (!sessionStore.currentSession) return;
 
-const trafficStore = useTrafficStore();
+  trafficStore.currentTrafficId.set(sessionStore.currentSession, id);
+}
+const onCellClick = (item: any) => {
+  handleRowClick(item.id);
+};
 
 const eventBus = useEventBus();
 
 // 监听活跃行变化
 watch(
-  () => trafficStore.currentTrafficId,
-  async (newValue) => {
-    if (!newValue) {
+  [() => trafficStore.currentTrafficId, () => sessionStore.currentSession],
+  async () => {
+    if (!sessionStore.currentSession) return;
+    const id = trafficStore.currentTrafficId.get(sessionStore.currentSession);
+    if (!id) {
       eventBus.emit("change:trafficDetail", null);
       return;
     }
 
-    if (newValue && newValue !== 0) {
-      const traffic = trafficStore.trafficList.get(newValue);
+    if (id && id !== 0) {
+      // if (!sessionStore.currentSession) return;
+
+      const currentSessionTraffics = trafficStore.trafficList.get(
+        sessionStore.currentSession
+      );
+      if (!currentSessionTraffics) return;
+
+      const traffic = currentSessionTraffics.get(id);
       if (!traffic) return;
       const res = await queryTrafficDetail(traffic.id);
-
       trafficStore.trafficDetail = res;
       eventBus.emit("change:trafficDetail", trafficStore.trafficDetail);
     }
+  },
+  {
+    deep: true
   }
 );
+
+defineExpose({
+  virtualTableRef
+});
 </script>
 
 <style scoped>

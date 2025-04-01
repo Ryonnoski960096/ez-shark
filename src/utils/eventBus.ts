@@ -1,4 +1,5 @@
-import { ITrafficDataDetail } from "@/stores/traffic";
+import type { ITrafficDataDetail } from "@/stores/traffic";
+import { error } from "@tauri-apps/plugin-log";
 
 // 事件处理函数类型
 type EventHandler<T = any> = (payload: T) => void;
@@ -75,8 +76,8 @@ class EventBus<T extends EventMap = EventMap> {
       this.handlers.get(event)!.forEach((handler) => {
         try {
           handler(payload);
-        } catch (error) {
-          console.error(`Error in event handler for ${String(event)}:`, error);
+        } catch (e) {
+          error(`Error in event handler for ${String(event)}:${e}`);
         }
       });
     }
@@ -95,6 +96,15 @@ class EventBus<T extends EventMap = EventMap> {
   public listenerCount<K extends keyof T & string>(event: K): number {
     return this.handlers.get(event)?.size || 0;
   }
+}
+
+export interface ActiveTraffic {
+  id: string;
+  keyword: string;
+  position: string;
+  index: number;
+  method?: "response" | "request";
+  sessionId: string;
 }
 
 // 定义具体的事件类型映射

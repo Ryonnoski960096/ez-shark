@@ -1,7 +1,9 @@
 use anyhow::Result;
 use async_compression::tokio::bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZstdDecoder};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::prelude::BASE64_STANDARD_NO_PAD;
+use base64::Engine as _;
+use log::debug;
 use serde::de::Error;
 use serde::Serialize;
 use serde::{Deserialize, Deserializer, Serializer};
@@ -12,7 +14,6 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, BufReader, BufWriter},
 };
 use unicode_width::UnicodeWidthStr;
-
 // 1
 
 use std::collections::{HashMap, HashSet};
@@ -30,11 +31,10 @@ static CLIPBOARD: LazyLock<Arc<std::sync::Mutex<Option<arboard::Clipboard>>>> =
     LazyLock::new(|| std::sync::Arc::new(std::sync::Mutex::new(arboard::Clipboard::new().ok())));
 
 pub fn base64_encode(data: &[u8]) -> String {
-    STANDARD.encode(data)
+    BASE64_STANDARD_NO_PAD.encode(data)
 }
 
-pub fn ellipsis_tail(text: &str, width: u16) -> String {
-    let width = width as _;
+pub fn ellipsis_tail(text: &str, width: usize) -> String {
     let text_width = text.width();
     if text_width > width {
         format!("{}…", &text[..width - 1])
@@ -43,8 +43,7 @@ pub fn ellipsis_tail(text: &str, width: u16) -> String {
     }
 }
 
-pub fn ellipsis_head(text: &str, width: u16) -> String {
-    let width = width as _;
+pub fn ellipsis_head(text: &str, width: usize) -> String {
     let text_width = text.width();
     if text_width > width {
         format!("…{}", &text[text_width - width + 1..])
@@ -312,11 +311,6 @@ where
     }
 }
 
-// 辅助函数，用于解析日期时间字符串
-fn deserialize_datetime(date_str: &str) -> Result<OffsetDateTime, time::error::Parse> {
-    OffsetDateTime::parse(date_str, &time::format_description::well_known::Rfc3339)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,7 +427,7 @@ impl<R: AsyncRead + Unpin> ProtobufUnknownParser<R> {
                 Ok(true) => continue,
                 Ok(false) => break,
                 Err(e) => {
-                    eprintln!("Error parsing field: {}", e);
+                    debug!("Error parsing field: {}", e);
                     if self.data.read_u8().await.is_err() {
                         break;
                     }
@@ -508,10 +502,10 @@ impl<R: AsyncRead + Unpin> ProtobufUnknownParser<R> {
             }
         }
 
-        println!("推测的消息结构:");
+        debug!("推测的消息结构:");
         for (field, types) in &structure {
             let type_strings: Vec<String> = types.iter().cloned().collect();
-            println!("{}: {}", field, type_strings.join(" | "));
+            debug!("{}: {}", field, type_strings.join(" | "));
         }
     }
 
@@ -587,4 +581,41 @@ pub fn extract_domain(url: &str) -> String {
         .unwrap_or("");
 
     domain.to_string()
+}
+
+pub fn add_data_url_prefix(base64_data: &str) -> String {
+    // 移除可能存在的空白字符
+    let clean_data = base64_data.trim();
+
+    // 判断是否已经是Data URL
+    if clean_data.starts_with("data:") {
+        // 已经是Data URL，直接返回
+        return clean_data.to_string();
+    }
+
+    // 文件类型识别规则（基于Base64编码的文件头）
+    let mime_type = if clean_data.starts_with("iVBOR") {
+        Some("image/png")
+    } else if clean_data.starts_with("/9j/") {
+        Some("image/jpeg")
+    } else if clean_data.starts_with("R0lG") {
+        Some("image/gif")
+    } else if clean_data.starts_with("UklGR") {
+        Some("image/webp")
+    } else if clean_data.starts_with("Qk") {
+        Some("image/bmp")
+    } else if clean_data.starts_with("PD94") {
+        Some("image/svg+xml") // 可能是SVG（XML头部）
+    } else if clean_data.starts_with("JVBERi0") {
+        Some("application/pdf") // PDF
+    } else {
+        // 无法识别类型，返回None
+        None
+    };
+
+    // 如果能识别类型，构建完整的Data URL；否则返回原始Base64
+    match mime_type {
+        Some(mime) => format!("data:{};base64,{}", mime, clean_data),
+        None => clean_data.to_string(), // 无法识别时返回原始Base64
+    }
 }

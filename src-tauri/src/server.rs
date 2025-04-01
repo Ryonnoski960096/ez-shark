@@ -2,7 +2,8 @@ use crate::frontend_message::{send_to_frontend, Payload, SendData, Status};
 use crate::models::crypto::CRYPTO_SERVICE;
 use crate::models::external_proxy::check_proxy_config;
 use crate::models::{get_proxy_config, ExternalProxy};
-use crate::traffic::{self, bytes_to_hex_structs, TrafficHead};
+use crate::state::BreakpointsConfig;
+use crate::traffic::{bytes_to_hex_structs, TrafficHead};
 use crate::{
     cert::CertificateAuthority,
     rewind::Rewind,
@@ -15,7 +16,6 @@ use async_compression::tokio::{
     bufread::{BrotliDecoder, DeflateDecoder, GzipDecoder, ZstdDecoder},
     write::{BrotliEncoder, DeflateEncoder, GzipEncoder, ZstdEncoder},
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use bytes::Bytes;
 use headers::Authorization;
 use http::HeaderMap;
@@ -42,10 +42,8 @@ use log::{debug, error, info};
 use pin_project_lite::pin_project;
 use serde::ser::StdError;
 use serde::Serialize;
-use serde_json::de;
 use std::error::Error;
 use std::marker::Unpin;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::{
     collections::HashMap,
@@ -59,6 +57,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
+use tauri_plugin_store::StoreBuilder;
 use time::OffsetDateTime;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -138,7 +137,7 @@ impl ServerBuilder {
     }
 
     pub fn build(self) -> Arc<Server> {
-        let temp_dir = std::env::temp_dir().join(format!("ezshark-{}", process::id()));
+        let temp_dir = std::env::temp_dir().join(format!("ez-shark-{}", process::id()));
         info!("temp_dir={}", temp_dir.display(),);
         Arc::new(Server {
             ca: self.ca,
@@ -156,7 +155,7 @@ impl ServerBuilder {
 pub struct Server {
     ca: Arc<CertificateAuthority>,
     state: Arc<State>,
-    temp_dir: PathBuf,
+    pub temp_dir: PathBuf,
     app_handle: tauri::AppHandle,
 }
 
@@ -278,6 +277,20 @@ impl Server {
         Ok(stop_tx)
     }
 
+    pub fn get_breakpoints_config(&self) -> BreakpointsConfig {
+        let store_path: PathBuf = PathBuf::from("settings.json");
+
+        let store = StoreBuilder::new(&self.app_handle, store_path)
+            .build()
+            .expect("store build failed");
+        // 继续处理
+        let breakpoints_config: BreakpointsConfig = store
+            .get("breakpoints")
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        breakpoints_config
+    }
+
     pub fn state(&self) -> Arc<State> {
         self.state.clone()
     }
@@ -380,7 +393,7 @@ impl Server {
     async fn continue_request<B>(
         &self,
         bytes: B,
-        traffic: Traffic,
+        traffic: Arc<Traffic>,
         head_id: Option<usize>,
     ) -> Result<Response, hyper::Error>
     where
@@ -451,7 +464,7 @@ impl Server {
         proxy_config: &ExternalProxy,
         https: HttpsConnector<HttpConnector>,
         mut proxy_req: hyper::Request<B>,
-        traffic: Traffic,
+        traffic: Arc<Traffic>,
         head_id: Option<usize>,
     ) -> Result<Response, hyper::Error>
     where
@@ -479,17 +492,19 @@ impl Server {
             let proxy_uri: Uri = format!("http://{}:{}", host, port).parse().unwrap();
             let mut proxy = Proxy::new(Intercept::All, proxy_uri.clone());
 
-            let username = &mutable_external_proxy_configuration.username;
-            let encrypted_password = &mutable_external_proxy_configuration.encrypted_password;
-            // 创建一个变量来存储解密后的密码，确保它的生命周期足够长
-            let decrypted_password = match CRYPTO_SERVICE.decrypt(encrypted_password) {
-                Ok(decrypted_text) => decrypted_text,
-                Err(e) => {
-                    return self.internal_server_error(e, traffic, head_id).await;
-                }
-            };
+            if mutable_external_proxy_configuration.requires_authentication {
+                let username = &mutable_external_proxy_configuration.username;
+                let encrypted_password = &mutable_external_proxy_configuration.encrypted_password;
 
-            proxy.set_authorization(Authorization::basic(username, &decrypted_password));
+                let decrypted_password = match CRYPTO_SERVICE.decrypt(encrypted_password) {
+                    Ok(decrypted_text) => decrypted_text,
+                    Err(e) => {
+                        return self.internal_server_error(e, traffic, head_id).await;
+                    }
+                };
+
+                proxy.set_authorization(Authorization::basic(username, &decrypted_password));
+            }
             proxy
         };
 
@@ -514,7 +529,7 @@ impl Server {
         &self,
         https: HttpsConnector<HttpConnector>,
         proxy_req: hyper::Request<B>,
-        traffic: Traffic,
+        traffic: Arc<Traffic>,
         head_id: Option<usize>,
     ) -> Result<Response, hyper::Error>
     where
@@ -535,7 +550,7 @@ impl Server {
         &self,
         client: Client<C, B>,
         req: hyper::Request<B>,
-        mut traffic: Traffic,
+        traffic: Arc<Traffic>,
         head_id: Option<usize>,
     ) -> Result<Response, hyper::Error>
     where
@@ -547,9 +562,17 @@ impl Server {
         let proxy_res = client.request(req).await;
 
         if let Some(hd_id) = head_id {
-            traffic.end_time = Some(OffsetDateTime::now_utc());
-            traffic.set_transaction_state(TransactionState::Responding);
-            let _ = self.state.create_traffic_head(&traffic, hd_id).await;
+            // 创建一个可变的 Traffic 副本
+            let mut traffic_clone = Traffic::clone(&traffic);
+            traffic_clone.end_time = Some(OffsetDateTime::now_utc());
+            traffic_clone.set_transaction_state(TransactionState::Responding);
+
+            let current_session = self.state.get_current_session();
+            // 使用克隆后的 Traffic 创建 traffic_head
+            let _ = self
+                .state
+                .create_traffic_head(&traffic_clone, hd_id, current_session)
+                .await;
         }
 
         let proxy_res = match proxy_res {
@@ -566,7 +589,7 @@ impl Server {
     // 断点处理和暂停方法
     async fn handle_request_breakpoint_and_pause(
         &self,
-        mut traffic: Traffic,
+        mut traffic: Arc<Traffic>,
         mut body_bytes: Bytes,
         content_encoding: String,
         head_id: Option<usize>,
@@ -603,10 +626,10 @@ impl Server {
         send_to_frontend(new_pause_traffic_data.send_data, &self.app_handle);
 
         // 等待继续信号
-        println!("等待继续信号");
+        debug!("等待继续信号");
         // self.state.continue_notify.notified().await;
         notify.notified().await;
-        println!("收到请求继续信号");
+        debug!("收到请求继续信号");
 
         // 获取可能被修改的流量信息
         let (modified_traffic, modified_body) = {
@@ -618,7 +641,7 @@ impl Server {
                     result
                 }
                 None => {
-                    println!("未找到流量信息");
+                    debug!("未找到流量信息");
                     (traffic.clone(), Some(body_bytes.clone()))
                 }
             }
@@ -633,12 +656,13 @@ impl Server {
         body_bytes = match self.repack_body(body_bytes, Some(content_encoding)).await {
             Ok(body) => body,
             Err(e) => {
-                println!("Error repacking body: {:?}", e);
+                error!("Error repacking body: {:?}", e);
                 Bytes::new()
             }
         };
 
-        if let Some(ref mut headers) = traffic.req_headers {
+        let mut traffic_clone = Traffic::clone(&traffic);
+        if let Some(ref mut headers) = traffic_clone.req_headers {
             let content_length = headers
                 .items
                 .iter_mut()
@@ -657,10 +681,15 @@ impl Server {
                 }
             }
         }
+
+        traffic = Arc::new(traffic_clone);
         // let req_body = BodyWrapper::new(Full::new(body_bytes))
         let req_body_file = if traffic.valid {
-            match self.req_body_file(&mut traffic) {
-                Ok(v) => Some(v),
+            match self.req_body_file(traffic.clone()) {
+                Ok((file, t)) => {
+                    traffic = t;
+                    Some(file)
+                }
                 Err(err) => {
                     return self.internal_server_error(err, traffic, head_id).await;
                 }
@@ -679,11 +708,34 @@ impl Server {
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         if let Some(body) = body {
-            match body.collect().await {
-                Ok(collected) => Ok(collected.to_bytes()),
-                Err(_) => Err(String::from("Error collecting body")),
+            // debug!("body is Some：{:?}", body);
+
+            // 使用 tokio::time::timeout 添加超时机制
+            match tokio::time::timeout(std::time::Duration::from_secs(10), body.collect()).await {
+                Ok(result) => match result {
+                    Ok(collected) => {
+                        // debug!("collected: {:?}", collected);
+                        let bytes = collected.to_bytes();
+                        // debug!("收集到 {} 字节的数据", bytes.len());
+                        Ok(bytes)
+                    }
+                    Err(e) => {
+                        let err = e.into();
+                        error!("Error collecting body: {}", err);
+                        Err(format!("Error collecting body: {}", err))
+                    }
+                },
+                Err(_) => {
+                    // 超时处理
+                    error!("收集请求体超时，可能是数据流过大或连接问题");
+
+                    // 返回空数据而不是错误，让请求继续进行
+                    debug!("由于超时返回空数据");
+                    Ok(Bytes::new())
+                }
             }
         } else {
+            debug!("body is None，返回空字节");
             Ok(Bytes::from(""))
         }
     }
@@ -692,7 +744,7 @@ impl Server {
         &self,
         req_body: Option<Incoming>,
         res_body: Option<BoxBody<Bytes, anyhow::Error>>,
-        traffic: Traffic,
+        traffic: Arc<Traffic>,
     ) -> Result<(Bytes, TrafficBody, String), String> {
         // 先处理 body 并获取相应的 headers
         let (body_bytes, content_encoding) = if req_body.is_some() {
@@ -734,7 +786,7 @@ impl Server {
             match self.handle_body(body_bytes, content_encoding.clone()).await {
                 Ok(result) => result,
                 Err(e) => {
-                    println!("Error handling request body: {:?}", e);
+                    error!("Error handling request body: {:?}", e);
                     Bytes::from("")
                 }
             }
@@ -759,42 +811,50 @@ impl Server {
             return Ok(res);
         };
 
-        // let path = match uri.split_once('?') {
-        //     Some((v, _)) => v,
-        //     None => uri.as_str(),
-        // };
-
-        let mut traffic = Traffic::new(&uri, method.as_str());
+        // 先创建普通的 Traffic 对象
+        let mut traffic_obj = Traffic::new(&uri, method.as_str());
 
         let mut head: Option<TrafficHead>;
 
         // 基础检查和设置
-        traffic.set_start_time();
-        traffic.check_match();
-        traffic.set_req_headers(req.headers());
-        // println!("{:?}", req.headers());
+        traffic_obj.set_start_time();
+        traffic_obj.check_match();
+        traffic_obj.set_req_headers(req.headers());
+
+        // 设置完成后再包装到 Arc 中
+        let mut traffic = Arc::new(traffic_obj);
 
         if method == Method::CONNECT {
-            traffic.check_match();
             return self.handle_connect(req, traffic);
         }
-
-        // let body_bytes = req.into_body().collect().await?.to_bytes();
-
-        // traffic.req_body = Some(TrafficBody::bytes(&body_bytes));
-
+        let current_session = self.state.get_current_session();
         // 根据 monitor_traffic 状态处理
-        if self.state.monitor_traffic.load(Ordering::SeqCst) {
+        if self.state.is_monitor_traffic().await {
             // 只有在监控模式下才需要 add_traffic
-            match self.state.add_traffic(traffic.clone()).await {
+            debug!("监控模式下，添加流量");
+            match self
+                .state
+                .add_traffic(traffic.clone(), &current_session)
+                .await
+            {
                 Ok(traffic_head) => {
                     head = Some(traffic_head);
-                    traffic.end_time = Some(OffsetDateTime::now_utc());
-                    traffic.set_transaction_state(TransactionState::Requesting);
+                    {
+                        let mut traffic_clone = Traffic::clone(&traffic);
+                        traffic_clone.end_time = Some(OffsetDateTime::now_utc());
+                        traffic_clone.set_transaction_state(TransactionState::Requesting);
+
+                        // 将修改后的 Traffic 包装回 Arc
+                        traffic = Arc::new(traffic_clone);
+                    }
 
                     // 如果有head，创建流量头
                     if let Some(hd) = head {
-                        match self.state.create_traffic_head(&traffic, hd.id).await {
+                        match self
+                            .state
+                            .create_traffic_head(&traffic, hd.id, current_session)
+                            .await
+                        {
                             Ok(new_head) => head = Some(new_head),
                             Err(err) => {
                                 return self.internal_server_error(err, traffic, None).await
@@ -807,8 +867,11 @@ impl Server {
         } else {
             // 非监控模式下，处理请求体并继续
             let req_body_file = if traffic.valid {
-                match self.req_body_file(&mut traffic) {
-                    Ok(v) => Some(v),
+                match self.req_body_file(traffic.clone()) {
+                    Ok((file, t)) => {
+                        traffic = t;
+                        Some(file)
+                    }
                     Err(err) => return self.internal_server_error(err, traffic, None).await,
                 }
             } else {
@@ -817,10 +880,12 @@ impl Server {
             let req_body = BodyWrapper::new(req.into_body(), req_body_file, None, Some(headers));
             return self.continue_request(req_body, traffic, None).await;
         }
+        let breakpoints_config = self.get_breakpoints_config();
+
         // 继续处理
         let header_breakpoint_result = self
             .state
-            .check_breakpoints(&traffic, String::from("request"))
+            .check_breakpoints(breakpoints_config, &traffic, String::from("request"))
             .await;
         let head_id = head.map(|hd| hd.id);
 
@@ -839,7 +904,13 @@ impl Server {
                                 //  self.internal_server_error(err, traffic, head_id).await;
                             }
                         };
-                        traffic.req_body_hex = Some(bytes_to_hex_structs(&req_body_bytes));
+                        {
+                            let mut traffic_clone = Traffic::clone(&traffic);
+                            traffic_clone.req_body_hex =
+                                Some(bytes_to_hex_structs(&req_body_bytes));
+                            // 将修改后的 Traffic 包装回 Arc
+                            traffic = Arc::new(traffic_clone);
+                        }
                         // 检查请求体是否匹配
                         if self
                             .state
@@ -860,8 +931,11 @@ impl Server {
                                 .await;
                         } else {
                             let req_body_file = if traffic.valid {
-                                match self.req_body_file(&mut traffic) {
-                                    Ok(v) => Some(v),
+                                match self.req_body_file(traffic.clone()) {
+                                    Ok((file, t)) => {
+                                        traffic = t;
+                                        Some(file)
+                                    }
                                     Err(err) => {
                                         return self
                                             .internal_server_error(err, traffic, head_id)
@@ -891,8 +965,14 @@ impl Server {
                                 return self.internal_server_error(err, traffic, head_id).await;
                             }
                         };
-                        traffic.req_body_hex = Some(bytes_to_hex_structs(&req_body_bytes));
 
+                        {
+                            let mut traffic_clone = Traffic::clone(&traffic);
+                            traffic_clone.req_body_hex =
+                                Some(bytes_to_hex_structs(&req_body_bytes));
+                            // 将修改后的 Traffic 包装回 Arc
+                            traffic = Arc::new(traffic_clone);
+                        }
                         return self
                             .handle_request_breakpoint_and_pause(
                                 traffic,
@@ -905,8 +985,11 @@ impl Server {
                     _ => {
                         // 没有匹配，直接转发
                         let req_body_file = if traffic.valid {
-                            match self.req_body_file(&mut traffic) {
-                                Ok(v) => Some(v),
+                            match self.req_body_file(traffic.clone()) {
+                                Ok((file, t)) => {
+                                    traffic = t;
+                                    Some(file)
+                                }
                                 Err(err) => {
                                     return self.internal_server_error(err, traffic, head_id).await;
                                 }
@@ -918,7 +1001,13 @@ impl Server {
                             Ok(bytes) => {
                                 let hex_structs = bytes_to_hex_structs(&bytes);
                                 // 设置 16进制数据
-                                traffic.req_body_hex = Some(hex_structs);
+                                {
+                                    let mut traffic_clone = Traffic::clone(&traffic);
+                                    traffic_clone.req_body_hex = Some(hex_structs);
+                                    // 将修改后的 Traffic 包装回 Arc
+                                    traffic = Arc::new(traffic_clone);
+                                }
+
                                 let req_body = BodyWrapper::new(
                                     Full::new(bytes.clone()),
                                     req_body_file,
@@ -936,8 +1025,11 @@ impl Server {
             }
             None => {
                 let req_body_file = if traffic.valid {
-                    match self.req_body_file(&mut traffic) {
-                        Ok(v) => Some(v),
+                    match self.req_body_file(traffic.clone()) {
+                        Ok((file, t)) => {
+                            traffic = t;
+                            Some(file)
+                        }
                         Err(err) => {
                             return self.internal_server_error(err, traffic, head_id).await;
                         }
@@ -947,21 +1039,33 @@ impl Server {
                 };
 
                 // let req_body = BodyWrapper::new(req.into_body(), req_body_file, None);
+                // debug!("流量没有进入断点：{:?}", traffic.uri);
+
+                // debug!("req.into_body(){:?}", req.into_body());
 
                 match self.get_body_bytes(Some(req.into_body())).await {
                     Ok(bytes) => {
+                        // debug!("正在获取请求体...");
+
                         let hex_structs = bytes_to_hex_structs(&bytes);
                         // 设置 16进制数据
-                        traffic.req_body_hex = Some(hex_structs);
+                        {
+                            let mut traffic_clone = Traffic::clone(&traffic);
+                            traffic_clone.req_body_hex = Some(hex_structs);
+                            traffic = Arc::new(traffic_clone);
+                        }
+
                         let req_body = BodyWrapper::new(
                             Full::new(bytes.clone()),
                             req_body_file,
                             None,
                             Some(headers),
                         );
+                        // debug!("16进制设置完成");
                         return self.continue_request(req_body, traffic, head_id).await;
                     }
                     Err(e) => {
+                        debug!("获取请求体字节异常{:?}", e);
                         return self.internal_server_error(e, traffic, head_id).await;
                     }
                 }
@@ -1047,7 +1151,7 @@ impl Server {
     fn handle_connect(
         self: Arc<Self>,
         mut req: Request,
-        mut traffic: Traffic,
+        traffic: Arc<Traffic>,
     ) -> Result<Response, hyper::Error> {
         let mut res = Response::default();
         let authority = match req.uri().authority().cloned() {
@@ -1058,6 +1162,8 @@ impl Server {
             }
         };
         let server = self.clone();
+        let mut traffic_clone = Traffic::clone(&traffic);
+
         let fut = async move {
             match hyper::upgrade::on(&mut req).await {
                 Ok(upgraded) => {
@@ -1067,9 +1173,10 @@ impl Server {
                     let bytes_read = match upgraded.read_exact(&mut buffer).await {
                         Ok(bytes_read) => bytes_read,
                         Err(err) => {
-                            traffic.add_error(format!(
+                            traffic_clone.add_error(format!(
                                 "Failed to read from upgraded connection: {err}"
                             ));
+
                             return;
                         }
                     };
@@ -1083,14 +1190,20 @@ impl Server {
                             .serve_connect_stream(upgraded, Scheme::HTTP, authority)
                             .await
                         {
-                            traffic.add_error(format!("Websocket connect error: {err}"));
+                            traffic_clone.add_error(format!(
+                                "Failed to read from upgraded connection: {err}"
+                            ));
                         }
                     } else if buffer[..2] == *b"\x16\x03" {
                         let server_config = match self.ca.gen_server_config(&authority).await {
                             Ok(server_config) => server_config,
                             Err(err) => {
-                                println!("Failed to build server config");
-                                traffic.add_error(format!("Failed to build server config: {err}"));
+                                error!("Failed to build server config");
+
+                                traffic_clone
+                                    .add_error(format!("Failed to build server config: {err}"));
+                                // 将修改后的 Traffic 包装回 Arc
+
                                 return;
                             }
                         };
@@ -1098,11 +1211,12 @@ impl Server {
                         let stream = match TlsAcceptor::from(server_config).accept(upgraded).await {
                             Ok(stream) => stream,
                             Err(err) => {
-                                println!("Failed to establish TLS Connection");
+                                error!("Failed to establish TLS Connection");
 
-                                traffic.add_error(format!(
+                                traffic_clone.add_error(format!(
                                     "Failed to establish TLS Connection: {err}"
                                 ));
+
                                 return;
                             }
                         };
@@ -1115,20 +1229,23 @@ impl Server {
                                 .to_string()
                                 .starts_with("error shutting down connection")
                             {
-                                traffic.add_error(format!("HTTPS connect error: {err}"));
+                                traffic_clone.add_error(format!("HTTPS connect error: {err}"));
                             }
                         }
                     } else {
-                        traffic.add_error(format!(
-                            "Unknown protocol, read '{:02X?}' from upgraded connection",
-                            &buffer[..bytes_read]
-                        ));
+                        {
+                            traffic_clone.add_error(format!(
+                                "Unknown protocol, read '{:02X?}' from upgraded connection",
+                                &buffer[..bytes_read]
+                            ));
+                        }
 
                         let mut server = match TcpStream::connect(authority.as_str()).await {
                             Ok(server) => server,
                             Err(err) => {
-                                traffic
+                                traffic_clone
                                     .add_error(format! {"Failed to connect to {authority}: {err}"});
+
                                 return;
                             }
                         };
@@ -1136,7 +1253,7 @@ impl Server {
                         if let Err(err) =
                             tokio::io::copy_bidirectional(&mut upgraded, &mut server).await
                         {
-                            traffic.add_error(format!(
+                            traffic_clone.add_error(format!(
                                 "Failed to tunnel unknown protocol to {}: {}",
                                 authority, err
                             ));
@@ -1144,15 +1261,19 @@ impl Server {
                     }
                 }
                 Err(err) => {
-                    println!("err!!:{:#?}", err);
-                    traffic.add_error(format!("Upgrade error: {err}"));
+                    error!("err!!:{:#?}", err);
+                    traffic_clone.add_error(format!("Upgrade error: {err}"));
                 }
             };
-            // let state = server.state.clone();
-            if !server.state.monitor_traffic.load(Ordering::SeqCst) {
+            if !server.state.is_monitor_traffic().await {
                 return;
             }
-            let _ = server.state.add_traffic(traffic).await;
+            let current_session = server.state.get_current_session();
+
+            let _ = server
+                .state
+                .add_traffic(Arc::new(traffic_clone), &current_session)
+                .await;
         };
 
         tokio::spawn(fut);
@@ -1193,7 +1314,7 @@ impl Server {
 
     async fn handle_response_breakpoint_and_pause(
         &self,
-        mut traffic: Traffic,
+        mut traffic: Arc<Traffic>,
         mut body_bytes: Bytes,
         content_encoding: String,
         head_id: Option<usize>,
@@ -1206,7 +1327,7 @@ impl Server {
             traffic_type: String::from("response"),
         };
 
-        println!("命中响应断点,准备暂停");
+        debug!("命中响应断点,准备暂停");
 
         let notify = Arc::new(Notify::new());
         {
@@ -1224,9 +1345,9 @@ impl Server {
         // let _ = self.state.pause_notifier.send((id.clone(), traffic_data));
         let new_pause_traffic_data = NewPauseTrafficData::new((Some(id.clone()), traffic_data));
         send_to_frontend(new_pause_traffic_data.send_data, &self.app_handle);
-        println!("等待继续信号");
+        debug!("等待继续信号");
         notify.notified().await;
-        println!("继续响应执行");
+        debug!("继续响应执行");
 
         let (modified_traffic, modified_body) = {
             let mut paused = self.state.paused_traffic.lock().await;
@@ -1237,7 +1358,7 @@ impl Server {
                     result
                 }
                 None => {
-                    println!("未找到流量信息");
+                    debug!("未找到流量信息");
                     (traffic.clone(), Some(body_bytes.clone()))
                 }
             }
@@ -1257,25 +1378,31 @@ impl Server {
         {
             Ok(body) => body,
             Err(e) => {
-                println!("Error repacking body: {:?}", e);
+                error!("Error repacking body: {:?}", e);
                 Bytes::new()
             }
         };
 
-        if let Some(ref mut headers) = traffic.res_headers {
-            let content_length = headers
-                .items
-                .iter_mut()
-                .find(|predicate| predicate.name == "content-length");
-            match content_length {
-                Some(header) => {
-                    header.value = final_body.len().to_string();
+        // 创建一个可变的 Traffic 副本
+        {
+            let mut traffic_clone = Traffic::clone(&traffic);
+            if let Some(ref mut headers) = traffic_clone.res_headers {
+                let content_length = headers
+                    .items
+                    .iter_mut()
+                    .find(|predicate| predicate.name == "content-length");
+                match content_length {
+                    Some(header) => {
+                        header.value = final_body.len().to_string();
+                    }
+                    None => headers.items.push(Header {
+                        name: "content-length".to_string(),
+                        value: final_body.len().to_string(),
+                    }),
                 }
-                None => headers.items.push(Header {
-                    name: "content-length".to_string(),
-                    value: final_body.len().to_string(),
-                }),
             }
+
+            traffic = Arc::new(traffic_clone);
         }
         let body: BoxBody<Bytes, anyhow::Error> = Full::new(final_body)
             .map_err(|never: Infallible| -> anyhow::Error {
@@ -1290,7 +1417,7 @@ impl Server {
     async fn continue_response(
         &self,
         body: BoxBody<Bytes, anyhow::Error>,
-        mut traffic: Traffic,
+        mut traffic: Arc<Traffic>,
         encoding: String,
         head_id: Option<usize>,
     ) -> Result<Response, hyper::Error> {
@@ -1298,7 +1425,7 @@ impl Server {
         let status_code = match StatusCode::from_u16(traffic.status.clone().unwrap()) {
             Ok(value) => value,
             Err(e) => {
-                println!("Invalid status code: {}", e);
+                error!("Invalid status code: {}", e);
                 return self
                     .internal_server_error("Invalid status code", traffic, head_id)
                     .await;
@@ -1316,8 +1443,11 @@ impl Server {
         }
 
         let res_body_file = if traffic.valid {
-            match self.res_body_file(&mut traffic, &encoding) {
-                Ok(v) => Some(v),
+            match self.res_body_file(traffic.clone(), &encoding) {
+                Ok((file, t)) => {
+                    traffic = t;
+                    Some(file)
+                }
                 Err(err) => {
                     return self.internal_server_error(err, traffic, head_id).await;
                 }
@@ -1337,14 +1467,35 @@ impl Server {
 
         match head_id {
             Some(hd_id) => {
-                traffic.end_time = Some(OffsetDateTime::now_utc());
+                let mut traffic_clone = Traffic::clone(&traffic);
+                traffic_clone.end_time = Some(OffsetDateTime::now_utc());
+                traffic_clone.set_transaction_state(TransactionState::ResponseDone);
 
-                traffic.set_transaction_state(TransactionState::ResponseDone);
-                let _ = self.state.create_traffic_head(&traffic, hd_id).await;
+                traffic = Arc::new(traffic_clone);
+                let current_session = self.state.get_current_session();
+                let _ = self
+                    .state
+                    .create_traffic_head(&traffic, hd_id, current_session)
+                    .await;
                 // println!("响应完成-----------------{:?}----------------------",traffic);
                 {
-                    let mut traffics = self.state.traffics.lock().await;
-                    traffics.insert(hd_id, traffic);
+                    let current_session = self.state.get_current_session();
+
+                    // 获取session的读锁
+                    let sessions = self.state.session.read().await;
+
+                    // 获取对应会话的 Mutex<IndexMap>
+                    let session_traffics = sessions.get(&current_session).unwrap_or_else(|| {
+                        // 理论上说，session_traffics一定存在
+                        panic!("Session not found: {}", current_session);
+                        // error!("Session not found: {}", current_session);
+                    });
+
+                    // 锁定特定会话的 IndexMap
+                    let mut session_traffics_locked = session_traffics.lock().await;
+
+                    // 插入流量
+                    session_traffics_locked.insert(hd_id, traffic);
                 }
             }
             None => {}
@@ -1356,7 +1507,7 @@ impl Server {
     async fn process_proxy_res<T: Body<Data = Bytes> + Send + Sync + 'static>(
         &self,
         proxy_res: hyper::Response<T>,
-        mut traffic: Traffic,
+        mut traffic: Arc<Traffic>,
         head_id: Option<usize>,
     ) -> Result<Response, hyper::Error> {
         // let before = time::Instant::now();
@@ -1368,18 +1519,21 @@ impl Server {
         let proxy_res_version = proxy_res.version();
         let proxy_res_status = proxy_res.status();
         let proxy_res_headers = proxy_res.headers().clone();
+        {
+            let mut traffic_clone = Traffic::clone(&traffic);
+            traffic_clone
+                .set_res_status(proxy_res_status)
+                .set_http_version(&proxy_res_version)
+                .set_res_headers(&proxy_res_headers);
 
-        traffic
-            .set_res_status(proxy_res_status)
-            .set_http_version(&proxy_res_version)
-            .set_res_headers(&proxy_res_headers);
+            let _content_type = proxy_res_headers
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
 
-        let _content_type = proxy_res_headers
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-
-        traffic.check_match();
+            traffic_clone.check_match();
+            traffic = Arc::new(traffic_clone);
+        }
 
         let mut encoding: String = String::new();
         for (key, value) in proxy_res_headers.iter() {
@@ -1388,7 +1542,7 @@ impl Server {
             }
         }
 
-        if !self.state.monitor_traffic.load(Ordering::SeqCst) {
+        if !self.state.is_monitor_traffic().await {
             match head_id {
                 Some(_) => {}
                 None => match self.get_body_bytes(Some(proxy_res.into_body())).await {
@@ -1406,9 +1560,11 @@ impl Server {
             }
         }
 
+        let breakpoints_config = self.get_breakpoints_config();
+
         let header_breakpoint_result = self
             .state
-            .check_breakpoints(&traffic, String::from("response"))
+            .check_breakpoints(breakpoints_config, &traffic, String::from("response"))
             .await;
         match header_breakpoint_result {
             Some((breakpoints, match_result)) => {
@@ -1423,7 +1579,13 @@ impl Server {
                                 return self.internal_server_error(err, traffic, head_id).await;
                             }
                         };
-                        traffic.res_body_hex = Some(bytes_to_hex_structs(&res_body_bytes));
+                        {
+                            let mut traffic_clone = Traffic::clone(&traffic);
+
+                            traffic_clone.res_body_hex =
+                                Some(bytes_to_hex_structs(&res_body_bytes));
+                            traffic = Arc::new(traffic_clone);
+                        }
 
                         if self
                             .state
@@ -1463,8 +1625,13 @@ impl Server {
                                 return self.internal_server_error(err, traffic, head_id).await;
                             }
                         };
-                        traffic.res_body_hex = Some(bytes_to_hex_structs(&res_body_bytes));
+                        {
+                            let mut traffic_clone = Traffic::clone(&traffic);
 
+                            traffic_clone.res_body_hex =
+                                Some(bytes_to_hex_structs(&res_body_bytes));
+                            traffic = Arc::new(traffic_clone);
+                        }
                         return self
                             .handle_response_breakpoint_and_pause(
                                 traffic,
@@ -1478,8 +1645,12 @@ impl Server {
                         match self.get_body_bytes(Some(proxy_res.into_body())).await {
                             Ok(bytes) => {
                                 let hex_structs = bytes_to_hex_structs(&bytes);
+                                {
+                                    let mut traffic_clone = Traffic::clone(&traffic);
+                                    traffic_clone.res_body_hex = Some(hex_structs);
+                                    traffic = Arc::new(traffic_clone);
+                                }
                                 // 设置 16进制数据
-                                traffic.res_body_hex = Some(hex_structs);
                                 let body = Full::new(bytes)
                                     .map_err(|_: Infallible| -> anyhow::Error { unreachable!() });
                                 return self
@@ -1506,7 +1677,11 @@ impl Server {
                     Ok(bytes) => {
                         let hex_structs = bytes_to_hex_structs(&bytes);
                         // 设置 16进制数据
-                        traffic.res_body_hex = Some(hex_structs);
+                        {
+                            let mut traffic_clone = Traffic::clone(&traffic);
+                            traffic_clone.res_body_hex = Some(hex_structs);
+                            traffic = Arc::new(traffic_clone);
+                        }
                         let body = Full::new(bytes)
                             .map_err(|_: Infallible| -> anyhow::Error { unreachable!() });
                         return self
@@ -1524,7 +1699,7 @@ impl Server {
     async fn internal_server_error<T: std::fmt::Display>(
         &self,
         error: T,
-        mut traffic: Traffic,
+        mut traffic: Arc<Traffic>,
         head_id: Option<usize>,
         // traffic_done_tx: TrafficDoneSender,
     ) -> Result<Response, hyper::Error> {
@@ -1533,9 +1708,20 @@ impl Server {
             Some(hd_id) => {
                 *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                 // let gid = traffic.gid;
-                traffic.add_error(error.to_string());
-                traffic.set_transaction_state(TransactionState::Failed);
-                let _ = self.state.create_traffic_head(&traffic, hd_id).await;
+
+                {
+                    let mut traffic_clone = Traffic::clone(&traffic);
+                    traffic_clone.add_error(error.to_string());
+                    traffic_clone.set_transaction_state(TransactionState::Failed);
+
+                    traffic = Arc::new(traffic_clone);
+                }
+                let current_session = self.state.get_current_session();
+
+                let _ = self
+                    .state
+                    .create_traffic_head(&traffic, hd_id, current_session)
+                    .await;
                 // let _ = traffic_done_tx.send((gid, 0));
 
                 Ok(res)
@@ -1544,7 +1730,7 @@ impl Server {
         }
     }
 
-    fn req_body_file(&self, traffic: &mut Traffic) -> Result<File> {
+    fn req_body_file(&self, traffic: Arc<Traffic>) -> Result<(File, Arc<Traffic>)> {
         let mime = extract_mime(&traffic.req_headers);
         let ext_name = to_ext_name(mime);
         let path = self
@@ -1556,11 +1742,13 @@ impl Server {
                 path.display()
             )
         })?;
-        traffic.set_req_body_file(&path);
-        Ok(file)
+        let mut traffic_clone = Traffic::clone(&traffic);
+        traffic_clone.set_req_body_file(&path);
+        // traffic = Arc::new(traffic_clone);
+        Ok((file, Arc::new(traffic_clone)))
     }
 
-    fn res_body_file(&self, traffic: &mut Traffic, encoding: &str) -> Result<File> {
+    fn res_body_file(&self, traffic: Arc<Traffic>, encoding: &str) -> Result<(File, Arc<Traffic>)> {
         let mime = extract_mime(&traffic.res_headers);
         let ext = to_ext_name(mime);
         let encoding_ext = match ENCODING_EXTS.iter().find(|(v, _)| *v == encoding) {
@@ -1576,8 +1764,11 @@ impl Server {
                 path.display()
             )
         })?;
-        traffic.set_res_body_file(&path);
-        Ok(file)
+
+        let mut traffic_clone = Traffic::clone(&traffic);
+        traffic_clone.set_res_body_file(&path);
+
+        Ok((file, Arc::new(traffic_clone)))
     }
 }
 
@@ -1597,22 +1788,19 @@ pin_project! {
         traffic_done: Option<(Option<usize>, Arc<State>)>,
         raw_size: u64,   headers: Option<HeaderMap>,
     }
-     impl<B> PinnedDrop for BodyWrapper<B> {
+     impl<B> PinnedDrop for BodyWrapper<B>
+      {
         fn drop(this: Pin<&mut Self>) {
-
             if let Some((head_id, state)) = this.traffic_done.as_ref() {
-                if !state.monitor_traffic.load(Ordering::SeqCst) {
-                    return
-                }
-
                 match head_id{
                     Some(hd_id)=>{
-
                         let state = state.clone();
                         let head_id = *hd_id;
                         let raw_size = this.raw_size;
-
                         tokio::spawn(async move {
+                            if !state.is_monitor_traffic().await {
+                                return
+                            }
                             state.done_traffic(head_id, raw_size).await;
                         });
                     },None=>{}
@@ -1686,13 +1874,13 @@ where
                                 tokio::spawn(async move {
                                     match decode_protobuf(&data_clone).await {
                                         Ok(decoded) => {
-                                            println!("成功解析 protobuf 数据");
+                                            info!("成功解析 protobuf 数据");
                                             if let Err(e) = file_clone.write_all(&decoded) {
                                                 eprintln!("写入解码数据失败: {:?}", e);
                                             }
                                         }
                                         Err(e) => {
-                                            println!("protobuf 解析失败: {:?}", e);
+                                            error!("protobuf 解析失败: {:?}", e);
                                             if let Err(e) = file_clone.write_all(&data_clone) {
                                                 eprintln!("写入原始数据失败: {:?}", e);
                                             }
