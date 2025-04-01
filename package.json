@@ -1,7 +1,7 @@
 {
   "name": "ez-shark",
   "private": true,
-  "version": "0.4.8",
+  "version": "0.5.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -50,4 +50,3 @@
     "@iconify-json/qlementine-icons": "^1.2.1"
   }
 }
-
