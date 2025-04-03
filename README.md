@@ -1,5 +1,7 @@
 # EzShark
 
+**Documentation:** [中文文档](DOCS-zh.md) | [English Documentation](DOCS-en.md)
+
 ## feature
 
 - [ ] 默认配置文件
