@@ -45,7 +45,7 @@
               <!-- @change="mapLocalsEnabled(item)" -->
               <Switch size="small" v-model:checked="item.enabled" />
             </td>
-            <td style="width: 40%">
+            <td :title="item.url" style="width: 40%">
               {{ item.url }}
             </td>
             <td :title="item.headerLocal" style="width: 20%">
@@ -167,11 +167,11 @@ const deleteMapLocal = async (key: string) => {
 };
 
 // 编辑
-const editMapLocal = async (key: string) => {
-  openWindow({ key });
+const editMapLocal = async (item: MapLocalItem) => {
+  openWindow(item);
 };
 
-function oncontextmenu(e: MouseEvent, _: MapLocalItem, key: string) {
+function oncontextmenu(e: MouseEvent, item: MapLocalItem, key: string) {
   e.preventDefault();
 
   ContextMenu.showContextMenu({
@@ -180,7 +180,7 @@ function oncontextmenu(e: MouseEvent, _: MapLocalItem, key: string) {
     items: [
       {
         label: "编辑",
-        onClick: () => editMapLocal(key)
+        onClick: () => editMapLocal(item)
       },
       {
         label: "删除",
@@ -231,15 +231,17 @@ const generateTimestampKey = (): string => {
   return `mapLocal_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 };
 const createMapLocal = (
-  mapLocalItem: Omit<MapLocalItem, "enabled">
+  mapLocalItem: { url: string } & Partial<Omit<MapLocalItem, "url">>
 ): [string, MapLocalItem] => {
   const id = mapLocalItem.id || generateTimestampKey();
   return [
     id,
     {
       id,
-      enabled: true,
-      ...mapLocalItem
+      enabled: mapLocalItem.enabled || true,
+      url: mapLocalItem.url,
+      headerLocal: mapLocalItem.headerLocal || "",
+      bodyLocal: mapLocalItem.bodyLocal || ""
     }
   ];
 };
@@ -260,7 +262,7 @@ const openWindow = async (ops?: Record<string, any>) => {
   // 监听事件
   const unListen = await wvw.listen(MapLocalEvent.SUBMIT, (event) => {
     try {
-      const payload = event.payload as Omit<MapLocalItem, "id" | "enabled">;
+      const payload = event.payload as MapLocalItem;
 
       if (!mapLocal.value) {
         mapLocal.value = {

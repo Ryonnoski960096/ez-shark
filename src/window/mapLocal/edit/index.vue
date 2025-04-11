@@ -54,17 +54,38 @@ import { windowInit, windowManager } from "@/stores/WindowManager";
 import { open } from "@tauri-apps/plugin-dialog";
 import { deepClone } from "@/utils/tools";
 
-windowInit();
+interface ExtendedMapLocalItem {
+  url?: string;
+  headerLocal?: string;
+  bodyLocal?: string;
+  parentWindowId?: string;
+  enabled?: "true" | "false" | boolean;
+  id?: string;
+}
 
-const defaultMapLocalItem: Omit<MapLocalItem, "id" | "enabled"> = {
+const prams = windowInit() as ExtendedMapLocalItem;
+delete prams.parentWindowId;
+const defaultMapLocalItem: MapLocalItem = {
   url: "",
   headerLocal: "",
-  bodyLocal: ""
+  bodyLocal: "",
+  enabled: true
 };
 
-const mapLocalItem = ref<Omit<MapLocalItem, "id" | "enabled">>(
-  deepClone(defaultMapLocalItem)
-);
+const mapLocalItem = ref<MapLocalItem>(deepClone(defaultMapLocalItem));
+if (prams) {
+  console.log("prams", prams);
+  if (prams.enabled === "true") {
+    mapLocalItem.value.enabled = true;
+  }
+  if (prams.enabled === "false") {
+    mapLocalItem.value.enabled = false;
+  }
+  mapLocalItem.value.bodyLocal = prams.bodyLocal ?? "";
+  mapLocalItem.value.headerLocal = prams.headerLocal ?? "";
+  mapLocalItem.value.url = prams.url ?? "";
+  mapLocalItem.value.id = prams.id;
+}
 
 const selectHeaderFile = async () => {
   const path = await open({
@@ -92,12 +113,14 @@ const handleCancel = async () => {
 
 const onSubmit = async (e: Event) => {
   e.preventDefault();
-  if (
-    !mapLocalItem.value.url ||
-    !mapLocalItem.value.headerLocal ||
-    !mapLocalItem.value.bodyLocal
-  ) {
-    message.warning("请填写完整信息");
+  if (!mapLocalItem.value.url) {
+    message.warning("请填写 URL");
+    return;
+  }
+
+  // url 必填，headerLocal 和 bodyLocal 至少有一个
+  if (!mapLocalItem.value.headerLocal && !mapLocalItem.value.bodyLocal) {
+    message.warning("请填写 Header 或 Body 本地文件");
     return;
   }
 
