@@ -319,6 +319,7 @@ function formatQueryString(str: string): string {
 
 const { on } = useEventBus();
 on("change:trafficDetail", (data) => {
+  console.log("change:trafficDetail", data);
   isUpdated.value = false;
   // 重置
   reSetInfoParams();

@@ -19,6 +19,7 @@ import { helpMenuItems } from "./menu/help";
 import { fileMenuItems } from "./menu/file";
 import { ref, watch } from "vue";
 import { useSessionStore } from "@/stores/session";
+import { toolsMenuItems } from "./menu/tools";
 
 const sessionStore = useSessionStore();
 
@@ -38,6 +39,10 @@ const dropdownMenus = ref([
   {
     title: "Proxy",
     menuItems: proxyMenuItems
+  },
+  {
+    title: "Tools",
+    menuItems: toolsMenuItems
   },
   {
     title: "Settings",

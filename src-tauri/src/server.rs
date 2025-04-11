@@ -1,6 +1,7 @@
 use crate::frontend_message::{send_to_frontend, Payload, SendData, Status};
 use crate::models::crypto::CRYPTO_SERVICE;
 use crate::models::external_proxy::check_proxy_config;
+use crate::models::map_local::{check_need_map_local, get_map_local_config};
 use crate::models::{get_proxy_config, ExternalProxy};
 use crate::state::BreakpointsConfig;
 use crate::traffic::{bytes_to_hex_structs, TrafficHead};
@@ -43,12 +44,14 @@ use pin_project_lite::pin_project;
 use serde::ser::StdError;
 use serde::Serialize;
 use std::error::Error;
+use std::fs;
+use std::fs::File;
+use std::io::BufReader;
 use std::marker::Unpin;
 use std::time::Duration;
 use std::{
     collections::HashMap,
     convert::Infallible,
-    fs::File,
     io::Write,
     net::SocketAddr,
     path::PathBuf,
@@ -70,7 +73,6 @@ use uuid::Uuid;
 // type TrafficDoneSender = mpsc::UnboundedSender<(usize, u64)>;
 type Request = hyper::Request<Incoming>;
 type Response = hyper::Response<BoxBody<Bytes, anyhow::Error>>;
-
 pub type TrafficTuple = (Option<String>, TrafficData);
 
 #[derive(Debug, Clone, Serialize)]
@@ -393,7 +395,7 @@ impl Server {
     async fn continue_request<B>(
         &self,
         bytes: B,
-        traffic: Arc<Traffic>,
+        mut traffic: Arc<Traffic>,
         head_id: Option<usize>,
     ) -> Result<Response, hyper::Error>
     where
@@ -416,6 +418,125 @@ impl Server {
                     .await
             }
         };
+
+        if let Ok(map_local) = get_map_local_config(&self.app_handle) {
+            // debug!("map_local:{:?}", map_local);
+            if let Ok(item) = check_need_map_local(map_local) {
+                // 检查是否需要MapLocal
+                // debug!("item:{:?}", item);
+                if traffic.uri.contains(&item.url) {
+                    // debug!("匹配到MapLocal规则");
+                    let mut res = Response::default();
+                    *res.status_mut() = StatusCode::OK;
+                    let mut traffic_clone = Traffic::clone(&traffic);
+                    traffic_clone.set_res_status(StatusCode::OK);
+                    // 添加头部
+                    if !item.header_local.is_empty() {
+                        // debug!("读取header_local:{}", item.header_local);
+                        if let Ok(header_data) = File::open(item.header_local) {
+                            let reader = BufReader::new(header_data);
+                            if let Ok(json_value) =
+                                serde_json::from_reader::<_, serde_json::Value>(reader)
+                            {
+                                if let serde_json::Value::Object(map) = json_value {
+                                    let mut headers = HeaderMap::new();
+                                    for (key, value) in map.iter() {
+                                        if let (Ok(header_name), Ok(header_value)) = (
+                                            HeaderName::from_bytes(key.as_bytes()),
+                                            HeaderValue::from_str(
+                                                &value.to_string().trim_matches('"'),
+                                            ),
+                                        ) {
+                                            res.headers_mut()
+                                                .insert(&header_name, header_value.clone());
+                                            headers.insert(header_name, header_value);
+                                        }
+                                    }
+                                    traffic_clone.set_res_headers(&headers);
+                                }
+                            }
+                        }
+                    }
+
+                    // 构建 body
+                    let body = if !item.body_local.is_empty() {
+                        traffic_clone.res_body_file = Some(item.body_local.clone());
+                        // debug!("读取body_local:{}", item.body_local);
+                        if let Ok(b) = fs::read(item.body_local.clone()) {
+                            let bytes = Bytes::from(b);
+                            traffic_clone.res_body_hex = Some(bytes_to_hex_structs(&bytes));
+                            // debug!("设置 res_body_hex");
+                            BoxBody::new(Full::new(bytes))
+                                .map_err(|_: Infallible| anyhow::Error::msg("Body error"))
+                                .boxed()
+                        } else {
+                            // 文件读取失败，使用空 body
+                            BoxBody::new(Full::new(Bytes::new()))
+                                .map_err(|_: Infallible| anyhow::Error::msg("Empty body"))
+                                .boxed()
+                        }
+                    } else {
+                        // debug!("body_local为空，使用空 body");
+                        // 没有本地文件，使用空 body
+                        BoxBody::new(Full::new(Bytes::new()))
+                            .map_err(|_: Infallible| anyhow::Error::msg("Empty body"))
+                            .boxed()
+                    };
+                    let res_body: BodyWrapper<BoxBody<Bytes, anyhow::Error>> = {
+                        let body_file = match &traffic_clone.res_body_file {
+                            Some(file) => match File::open(file) {
+                                Ok(f) => Some(f),
+                                Err(_) => None,
+                            },
+                            None => None,
+                        };
+
+                        BodyWrapper::new(
+                            body,
+                            body_file,
+                            Some((head_id, self.state.clone())),
+                            Some(res.headers().clone()),
+                        )
+                    };
+                    *res.body_mut() = BoxBody::new(res_body);
+                    if let Some(hd_id) = head_id {
+                        let current_session = self.state.get_current_session();
+                        // debug!("current_session:{}", hd_id);
+                        // 使用克隆后的 Traffic 创建 traffic_head
+                        // Some(OffsetDateTime::now_utc())
+                        // traffic_clone.set_transaction_state(TransactionState::Completed);
+                        traffic = Arc::new(traffic_clone);
+                        // 获取session的写锁
+                        let sessions = self.state.session.read().await;
+
+                        // 获取当前会话
+                        let session_traffics: &Mutex<indexmap::IndexMap<usize, Arc<Traffic>>> =
+                            match sessions.get(&current_session) {
+                                Some(st) => st,
+                                None => {
+                                    error!("Session {} not found", current_session);
+                                    return self
+                                        .internal_server_error("", traffic, Some(hd_id))
+                                        .await;
+                                }
+                            };
+                        let mut traffics = session_traffics.lock().await;
+                        if let Some(existing_traffic) = traffics.get_mut(&hd_id) {
+                            *existing_traffic = traffic.clone();
+                        } else {
+                            error!("Traffic not found in session");
+                        }
+                        // // debug!("traffic:{:#?}", traffic);
+                        // let _ = self
+                        //     .state
+                        //     .create_traffic_head(&traffic, hd_id, current_session)
+                        //     .await;
+                    }
+
+                    return Ok(res);
+                }
+            }
+        }
 
         // 获取代理配置并检查是否需要使用代理
         match get_proxy_config(&self.app_handle) {

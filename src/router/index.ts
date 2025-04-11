@@ -4,7 +4,8 @@ import {
   breakpointRoute,
   settingRoute,
   externalProxyRoute,
-  searchRoute
+  searchRoute,
+  mapLocal
 } from "./routes";
 
 const routes = [
@@ -12,7 +13,8 @@ const routes = [
   ...breakpointRoute,
   ...settingRoute,
   ...externalProxyRoute,
-  ...searchRoute
+  ...searchRoute,
+  ...mapLocal
 ];
 
 const router = createRouter({
