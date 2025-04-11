@@ -54,7 +54,7 @@ pub fn check_need_map_local(map_local: MapLocal) -> Result<MapLocalItem, bool> {
     }
 
     for (_, item) in map_local.map_locals {
-        if item.enabled && item.body_local != "" && item.header_local != "" && item.url != "" {
+        if item.enabled && item.url != "" && (item.body_local != "" || item.header_local != "") {
             return Ok(item);
         }
     }

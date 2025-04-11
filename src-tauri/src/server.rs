@@ -501,10 +501,6 @@ impl Server {
                     *res.body_mut() = BoxBody::new(res_body);
                     if let Some(hd_id) = head_id {
                         let current_session = self.state.get_current_session();
-                        // debug!("current_session:{}", hd_id);
-                        // 使用克隆后的 Traffic 创建 traffic_head
-                        // Some(OffsetDateTime::now_utc())
-                        // traffic_clone.set_transaction_state(TransactionState::Completed);
                         traffic = Arc::new(traffic_clone);
                         // 获取session的写锁
                         let sessions = self.state.session.read().await;
@@ -526,13 +522,8 @@ impl Server {
                         } else {
                             error!("Traffic not found in session");
                         }
-                        // // debug!("traffic:{:#?}", traffic);
-                        // let _ = self
-                        //     .state
-                        //     .create_traffic_head(&traffic, hd_id, current_session)
-                        //     .await;
                     }
-
+                    // debug!("返回伪造响应");
                     return Ok(res);
                 }
             }
