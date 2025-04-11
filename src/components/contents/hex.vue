@@ -7,9 +7,14 @@
     v-bind="containerProps"
     class="h-500px w"
   >
+    <!-- {{ list }} -->
     <div v-bind="wrapperProps">
       <Button type="primary" @click="copyContent(hexString)">复制Hex</Button>
-      <div class="hex-cell h-35px" v-for="{ index, data } in list" :key="index">
+      <div
+        class="hex-cell h-35px"
+        v-for="{ index, data } in list"
+        :key="index + data.character_view"
+      >
         <div class="address">
           {{ toHex8(data.offset_address) }}
         </div>
@@ -33,16 +38,22 @@ import { toHex8 } from "@/utils/format";
 import { copyContent } from "@/utils/tools";
 import { useVirtualList } from "@vueuse/core";
 import { Button } from "ant-design-vue";
-import { computed } from "vue";
+import { computed, ref, watch } from "vue";
 
 const { hexBody } = defineProps<{
   hexBody: HexBody[];
 }>();
-
-const { list, containerProps, wrapperProps } = useVirtualList(hexBody, {
+const hbList = ref(hexBody);
+const { list, containerProps, wrapperProps } = useVirtualList(hbList, {
   itemHeight: 35,
   overscan: 4
 });
+watch(
+  () => hexBody,
+  () => {
+    hbList.value = hexBody;
+  }
+);
 
 const hexString = computed(() => {
   return hexBody
