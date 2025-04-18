@@ -7,7 +7,6 @@ pub mod server;
 pub mod state;
 pub mod traffic;
 pub mod utils;
-
 use crate::models::{charles, charles::CharlesConverter};
 use crate::{
     cert::CertificateAuthority,
@@ -20,12 +19,12 @@ use anyhow::Result;
 
 use chrono::{Datelike, Local};
 
+use base64::{engine::general_purpose, Engine as _};
 use indexmap::IndexMap;
-use log::info;
+use log::{debug, info};
 use models::ExternalProxy;
 use serde::Serialize;
 use state::{SearchResult, TrafficModification};
-
 use std::{
     fs,
     net::{IpAddr, SocketAddr},
@@ -38,7 +37,6 @@ use tauri::State;
 use tauri_plugin_log::{fern, Target, TargetKind};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_store::StoreBuilder;
-
 use time::OffsetDateTime;
 use tokio::sync::{oneshot, Mutex};
 use tokio::{net::TcpListener, time::Duration};
@@ -68,6 +66,38 @@ pub struct TrafficDetail {
     pub res_body_hex: Option<Vec<BodyHex>>,
     pub req_body: Option<Body>,
     pub res_body: Option<Body>,
+}
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct ProxyAuth {
+    username: String,
+    password: String,
+}
+
+impl ProxyAuth {
+    fn deserialize_auth_header(header: &str) -> Option<(String, String)> {
+        // 解析 Basic 认证
+        if !header.starts_with("Basic ") {
+            return None;
+        }
+
+        // 解码 Base64
+        match general_purpose::STANDARD.decode(&header[6..]) {
+            Ok(decoded) => {
+                let credentials = String::from_utf8_lossy(&decoded);
+                debug!("credentials: {}", credentials);
+                let parts: Vec<&str> = credentials.split(':').collect();
+
+                // 确保解析出两个部分
+                if parts.len() == 2 {
+                    Some((parts[0].to_string(), parts[1].to_string()))
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
+    }
 }
 
 pub struct ProxyServer {
@@ -193,10 +223,12 @@ impl ProxyServer {
             }
         };
 
-        // 创建新的服务器
-        let server = ServerBuilder::new(Arc::clone(&self.ca), self.app_handle.clone())
-            .print_mode(PrintMode::Oneline)
-            .build();
+        // 创建服务器构建器
+        let mut server_builder = ServerBuilder::new(Arc::clone(&self.ca), self.app_handle.clone())
+            .print_mode(PrintMode::Oneline);
+
+        // 构建服务器
+        let server = server_builder.build();
 
         // 迁移旧状态
         if let Some(old_state) = old_state {

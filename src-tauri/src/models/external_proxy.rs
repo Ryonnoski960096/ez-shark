@@ -57,15 +57,8 @@ impl From<StringOrNumber> for String {
 /// 代理详细配置信息  
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MutableExternalProxyConfiguration {
-    #[serde(deserialize_with = "deserialize_to_string")]
-    pub domain: String,
     #[serde(rename = "encryptedPassword")]
     pub encrypted_password: String,
-    #[serde(deserialize_with = "deserialize_to_string")]
-    pub host: String,
-    pub port: u16,
-    #[serde(rename = "requiresAuthentication")]
-    pub requires_authentication: bool,
     #[serde(deserialize_with = "deserialize_to_string")]
     pub username: String,
 }
@@ -88,33 +81,21 @@ impl ExternalProxy {
                 entry: vec![
                     ProxyEntry {
                         mutable_external_proxy_configuration: MutableExternalProxyConfiguration {
-                            domain: String::new(),
                             encrypted_password: String::new(),
-                            host: String::new(),
-                            port: 8080,
-                            requires_authentication: false,
                             username: String::new(),
                         },
                         string: "http".to_string(),
                     },
                     ProxyEntry {
                         mutable_external_proxy_configuration: MutableExternalProxyConfiguration {
-                            domain: String::new(),
                             encrypted_password: String::new(),
-                            host: String::new(),
-                            port: 443,
-                            requires_authentication: false,
                             username: String::new(),
                         },
                         string: "https".to_string(),
                     },
                     ProxyEntry {
                         mutable_external_proxy_configuration: MutableExternalProxyConfiguration {
-                            domain: String::new(),
                             encrypted_password: String::new(),
-                            host: String::new(),
-                            port: 1080,
-                            requires_authentication: false,
                             username: String::new(),
                         },
                         string: "socks".to_string(),
@@ -167,13 +148,8 @@ pub fn check_proxy_config(proxy_config: &ExternalProxy, url: String) -> bool {
     let proxy_type = proxy_config.proxy_type.as_str();
     if proxy_config.configurations.entry.iter().any(|entry| {
         let config = &entry.mutable_external_proxy_configuration;
-        entry.string == proxy_type && (
-            // 检查基本配置是否为空
-            config.host.is_empty() || config.port == 0 ||
-            // 检查认证配置
-            (config.requires_authentication && 
-             (config.username.is_empty() || config.encrypted_password.is_empty()))
-        )
+        entry.string == proxy_type
+            && (config.username.is_empty() || config.encrypted_password.is_empty())
     }) {
         return false;
     }

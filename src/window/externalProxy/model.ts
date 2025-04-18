@@ -7,10 +7,6 @@ enum ProxyType {
 
 // 代理配置项接口
 interface MutableExternalProxyConfiguration {
-  requiresAuthentication: boolean;
-  host: string;
-  port: number;
-  domain: string;
   username: string;
   encryptedPassword: string;
 }
@@ -37,10 +33,6 @@ const defaultData: ExternalProxy = {
       {
         string: ProxyType.HTTP,
         mutableExternalProxyConfiguration: {
-          requiresAuthentication: false,
-          host: "",
-          port: 8080,
-          domain: "",
           username: "",
           encryptedPassword: ""
         }
@@ -48,10 +40,6 @@ const defaultData: ExternalProxy = {
       {
         string: ProxyType.HTTPS,
         mutableExternalProxyConfiguration: {
-          requiresAuthentication: false,
-          host: "",
-          port: 443,
-          domain: "",
           username: "",
           encryptedPassword: ""
         }
@@ -59,10 +47,6 @@ const defaultData: ExternalProxy = {
       {
         string: ProxyType.SOCKS,
         mutableExternalProxyConfiguration: {
-          requiresAuthentication: false,
-          host: "",
-          port: 1080,
-          domain: "",
           username: "",
           encryptedPassword: ""
         }

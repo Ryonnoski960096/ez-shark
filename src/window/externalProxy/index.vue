@@ -41,76 +41,14 @@
             <!-- 右侧配置详情 -->
             <div class="protocol-config" v-if="currentConfig">
               <ElForm label-width="auto" :model="currentConfig">
-                <ElFormItem size="small" label="Server:">
-                  <ElInput
-                    size="small"
-                    v-model="
-                      currentConfig.mutableExternalProxyConfiguration.host
-                    "
-                    :disabled="disabled"
-                    style="width: 230px"
-                    placeholder="Host"
-                  />
-                  <span class="mx-2">Port:</span>
-                  <ElInputNumber
-                    size="small"
-                    controls-position="right"
-                    v-model="
-                      currentConfig.mutableExternalProxyConfiguration.port
-                    "
-                    :min="1"
-                    :disabled="disabled"
-                    :max="65535"
-                    style="width: 100px"
-                  />
-                </ElFormItem>
-
-                <ElFormItem size="small">
-                  <ElCheckbox
-                    :disabled="disabled"
-                    v-model="
-                      currentConfig.mutableExternalProxyConfiguration
-                        .requiresAuthentication
-                    "
-                  >
-                    Proxy server requires authentication
-                  </ElCheckbox>
-                </ElFormItem>
-
-                <div
-                  :class="{
-                    'form-disabled':
-                      !currentConfig.mutableExternalProxyConfiguration
-                        .requiresAuthentication
-                  }"
-                >
-                  <ElFormItem size="small" label="Domain:">
-                    <ElInput
-                      v-model="
-                        currentConfig.mutableExternalProxyConfiguration.domain
-                      "
-                      style="width: 380px"
-                      :disabled="
-                        !currentConfig.mutableExternalProxyConfiguration
-                          .requiresAuthentication || disabled
-                      "
-                    />
-                    <div class="text-gray-400 text-11px mt-1">
-                      The domain field is only required for Windows
-                      authentication (NTLM).
-                    </div>
-                  </ElFormItem>
-
+                <div>
                   <ElFormItem size="small" label="Username:">
                     <ElInput
                       v-model="
                         currentConfig.mutableExternalProxyConfiguration.username
                       "
                       style="width: 380px"
-                      :disabled="
-                        !currentConfig.mutableExternalProxyConfiguration
-                          .requiresAuthentication || disabled
-                      "
+                      :disabled="disabled"
                     />
                   </ElFormItem>
 
@@ -123,10 +61,7 @@
                       type="password"
                       style="width: 380px"
                       show-password
-                      :disabled="
-                        !currentConfig.mutableExternalProxyConfiguration
-                          .requiresAuthentication || disabled
-                      "
+                      :disabled="disabled"
                     />
                   </ElFormItem>
                 </div>
@@ -189,7 +124,6 @@ import {
   ElForm,
   ElFormItem,
   ElInput,
-  ElInputNumber,
   ElRadioGroup,
   ElRadio
 } from "element-plus";
@@ -251,10 +185,6 @@ const proxyForm = ref<ExternalProxy>({
       {
         string: ProxyType.HTTP,
         mutableExternalProxyConfiguration: {
-          requiresAuthentication: false,
-          host: "",
-          port: 8080,
-          domain: "",
           username: "",
           encryptedPassword: ""
         }
@@ -262,10 +192,6 @@ const proxyForm = ref<ExternalProxy>({
       {
         string: ProxyType.HTTPS,
         mutableExternalProxyConfiguration: {
-          requiresAuthentication: false,
-          host: "",
-          port: 443,
-          domain: "",
           username: "",
           encryptedPassword: ""
         }
@@ -273,10 +199,6 @@ const proxyForm = ref<ExternalProxy>({
       {
         string: ProxyType.SOCKS,
         mutableExternalProxyConfiguration: {
-          requiresAuthentication: false,
-          host: "",
-          port: 1080,
-          domain: "",
           username: "",
           encryptedPassword: ""
         }

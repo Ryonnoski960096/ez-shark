@@ -1,5 +1,6 @@
 use std::{collections::HashMap, path::PathBuf};
 
+use log::debug;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_store::StoreBuilder;
@@ -48,15 +49,28 @@ pub fn get_map_local_config<R: Runtime>(app: &AppHandle<R>) -> Result<MapLocal, 
 // };
 
 /// 检查是否需要使用MapLocal
-pub fn check_need_map_local(map_local: MapLocal) -> Result<MapLocalItem, bool> {
+pub fn check_need_map_local(map_local: MapLocal, uri: &String) -> Result<MapLocalItem, bool> {
     if !map_local.tool_enabled {
         return Err(false);
     }
 
     for (_, item) in map_local.map_locals {
-        if item.enabled && item.url != "" && (item.body_local != "" || item.header_local != "") {
+        if item.enabled
+            && item.url != ""
+            && uri.trim().contains(&item.url.trim())
+            && (item.body_local != "" || item.header_local != "")
+        {
+            // debug!("traffic.uri:{:?} ,item.uri:{:?}", uri, item.url);
             return Ok(item);
         }
+        // if uri == "https://www.google.com/favicon.ico" {
+        //     // debug!("traffic.uri:{:?},item.uri:{:?}", uri, item.url);
+        //     debug!(
+        //         "item.enabled:{:?},item.body_local:{:?},item.header_local:{:?},uri.contains(&item.url):{:?},uri: {:?} item.url: {:?} ",
+        //         item.enabled, item.body_local, item.header_local, uri.contains(&item.url),uri, item.url
+        //     );
+        //     // return Ok(item);
+        // }
     }
 
     // 如果一切正常，可以返回 true

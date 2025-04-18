@@ -5,6 +5,7 @@ use crate::models::map_local::{check_need_map_local, get_map_local_config};
 use crate::models::{get_proxy_config, ExternalProxy};
 use crate::state::BreakpointsConfig;
 use crate::traffic::{bytes_to_hex_structs, TrafficHead};
+use crate::ProxyAuth;
 use crate::{
     cert::CertificateAuthority,
     rewind::Rewind,
@@ -25,6 +26,7 @@ use http::{
     uri::{Authority, Scheme},
     HeaderValue,
 };
+use http_body_util::Empty;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{
     body::{Body, Frame, Incoming},
@@ -39,6 +41,7 @@ use hyper_util::{
     client::legacy::Client,
     rt::{TokioExecutor, TokioIo},
 };
+use indexmap::IndexMap;
 use log::{debug, error, info};
 use pin_project_lite::pin_project;
 use serde::ser::StdError;
@@ -150,15 +153,24 @@ impl ServerBuilder {
             state: Arc::new(State::new(self.print_mode, self.app_handle.clone())),
             temp_dir,
             app_handle: self.app_handle,
+            connection_pool: Mutex::new(HashMap::new()),
+            proxy_auth: Mutex::new(None),
         })
     }
 }
+
+// pub struct ConnectionPool {
+//     proxy_auth: Option<ProxyAuth>,
+//     tcp_stream: TcpStream,
+// }
 
 pub struct Server {
     ca: Arc<CertificateAuthority>,
     state: Arc<State>,
     pub temp_dir: PathBuf,
     app_handle: tauri::AppHandle,
+    connection_pool: Mutex<HashMap<SocketAddr, Option<ProxyAuth>>>,
+    proxy_auth: Mutex<Option<ProxyAuth>>,
 }
 
 impl Server {
@@ -225,43 +237,54 @@ impl Server {
 
                         // let stream = Arc::new(cnx);
                         active_connections_clone.lock().await.insert(addr, cnx);
-
+                        info!("Accepted connection from {}", addr);
                         // let traffic_done_tx = traffic_done_tx.clone();
                         let server_cloned = server_cloned.clone();
-                        // let active_connections = active_connections_clone.clone();
-
                         shutdown.spawn_task(async move {
                             let io = TokioIo::new(stream_for_hyper);
 
+                            {
+                                let mut connection_pool = server_cloned.connection_pool.lock().await;
+                                connection_pool.insert(addr, None);
+                            }
+
+                            let service_server = server_cloned.clone();
                             let hyper_service = service_fn(move |request: hyper::Request<Incoming>| {
-                                server_cloned.clone().handle(request)
+                                let handle_server = service_server.clone();
+                                handle_server.handle(request, addr)
                             });
 
                             let res = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
                                 .serve_connection_with_upgrades(io, hyper_service)
                                 .await;
+                            // {
+                            //     let mut connection_pool = server_cloned.connection_pool.lock().await;
+                            //     connection_pool.remove(&addr);
+                            // }
 
                             if let Err(e) = res {
                                 error!("Connection error: {}", e);
                             }
-
-                            // active_connections.lock().await.remove(&addr);
                         });
                     }
                     _ = guard.cancelled() => {
                         let mut connections = active_connections_clone.lock().await;
                         // println!("connections:{:?}", connections);
 
-                    for (addr, stream) in connections.iter_mut() {
-                        info!("Closing connection to {}", addr);
-                        // let mut stream_guard = stream;
-                        // 使用异步 shutdown，需要 .await
-                        if let Err(e) = stream.shutdown().await {
-                            error!("Error shutting down connection to {}: {}", addr, e);
+                        for (addr, stream) in connections.iter_mut() {
+                            info!("Closing connection to {}", addr);
+                            // let mut stream_guard = stream;
+                            // 使用异步 shutdown，需要 .await
+                            if let Err(e) = stream.shutdown().await {
+                                error!("Error shutting down connection to {}: {}", addr, e);
+                            }
+                            {
+                                let mut connection_pool = server_cloned.connection_pool.lock().await;
+                                connection_pool.remove(addr);
+                            }
                         }
-                    }
-                    connections.clear();
-                    break;
+                        connections.clear();
+                        break;
                     }
                 }
             }
@@ -277,6 +300,404 @@ impl Server {
         // });
 
         Ok(stop_tx)
+    }
+
+    async fn create_proxy_auth(&self, req: &Request) -> Option<ProxyAuth> {
+        // 使用引用而不是克隆
+        // 检查 Proxy-Authorization 头
+        let auth_header = match req.headers().get("Proxy-Authorization") {
+            Some(header) => header,
+            None => return None,
+        };
+
+        debug!("检查头{:#?}", auth_header);
+
+        // 尝试解析认证头
+        let auth_str = match auth_header.to_str() {
+            Ok(str_value) => str_value,
+            Err(_) => return None,
+        };
+        debug!("auth_str {:#?}", auth_str);
+        // 反序列化认证信息
+        let (username, password) = match ProxyAuth::deserialize_auth_header(auth_str) {
+            Some(credentials) => credentials,
+            None => return None,
+        };
+        debug!("username: {:?}, password {:#?}", username, password);
+
+        // 验证凭证 (这里应该使用你的实际验证逻辑)
+        let proxy_auth = if self.validate_proxy_credentials(&username, &password) {
+            ProxyAuth { username, password }
+        } else {
+            return None;
+        };
+        info!("create_proxy_>auth->proxy_auth: {:#?}", proxy_auth);
+
+        // 将新的认证信息存入连接池
+
+        debug!("create_proxy_>auth->proxy_auth: {:#?}", proxy_auth);
+        Some(proxy_auth)
+    }
+
+    async fn handle(
+        self: Arc<Self>,
+        req: Request,
+        addr: SocketAddr,
+    ) -> Result<Response, hyper::Error> {
+        let headers = req.headers().clone();
+        let mut connection_pool = self.connection_pool.lock().await;
+
+        // 尝试获取已存在的代理认证信息
+        let proxy_auth = match connection_pool.get_mut(&addr) {
+            Some(auth) => match auth {
+                Some(p_a) => {
+                    if self.validate_proxy_credentials(&p_a.username, &p_a.password) {
+                        debug!("p_a:{:?}", p_a);
+                        Some(p_a.clone())
+                    } else {
+                        debug!("p_a:{:?}", p_a);
+                        let proxy_auth = self.create_proxy_auth(&req).await;
+                        match proxy_auth {
+                            Some(p_a) => {
+                                connection_pool.insert(addr, Some(p_a.clone()));
+                                Some(p_a)
+                            }
+                            None => return Ok(self.create_auth_required_response()),
+                        }
+                    }
+                }
+                None => {
+                    debug!("auth:{:?}", auth);
+                    let proxy_auth = self.create_proxy_auth(&req).await;
+                    debug!("auth->proxy_auth: {:#?}", proxy_auth);
+
+                    match proxy_auth {
+                        Some(p_a) => {
+                            connection_pool.insert(addr, Some(p_a.clone()));
+                            Some(p_a)
+                        }
+                        None => return Ok(self.create_auth_required_response()),
+                    }
+                }
+            },
+            None => {
+                let proxy_auth = self.create_proxy_auth(&req).await;
+                match proxy_auth {
+                    Some(p_a) => {
+                        connection_pool.insert(addr, Some(p_a.clone()));
+                        Some(p_a)
+                    }
+                    None => return Ok(self.create_auth_required_response()),
+                }
+            }
+        };
+        drop(connection_pool);
+
+        // 调试输出
+        debug!("proxy_auth: {:#?}", proxy_auth);
+
+        *self.proxy_auth.lock().await = proxy_auth;
+
+        let req_uri = req.uri().to_string();
+        debug!("Received headers: {:#?}", headers);
+        let method = req.method().clone();
+
+        // URI 处理
+        let uri = if !req_uri.starts_with('/') {
+            req_uri.clone()
+        } else {
+            let mut res = Response::default();
+            *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            set_res_body(&mut res, "No reserver proxy url");
+            return Ok(res);
+        };
+
+        // 先创建普通的 Traffic 对象
+        let mut traffic_obj = Traffic::new(&uri, method.as_str());
+        let mut head: Option<TrafficHead>;
+        // 基础检查和设置
+        traffic_obj.set_start_time();
+        traffic_obj.check_match();
+        traffic_obj.set_req_headers(req.headers());
+
+        // 设置完成后再包装到 Arc 中
+        let mut traffic = Arc::new(traffic_obj);
+
+        // 处理 CONNECT 方法
+        if method == Method::CONNECT {
+            let server_clone = Arc::clone(&self);
+            return server_clone.handle_connect(req, traffic, addr);
+        }
+
+        let current_session = self.state.get_current_session();
+        info!("11111111111111");
+        // 根据 monitor_traffic 状态处理
+        if self.state.is_monitor_traffic().await {
+            // 只有在监控模式下才需要 add_traffic
+            debug!("监控模式下，添加流量");
+            match self
+                .state
+                .add_traffic(traffic.clone(), &current_session)
+                .await
+            {
+                Ok(traffic_head) => {
+                    head = Some(traffic_head);
+                    {
+                        let mut traffic_clone = Traffic::clone(&traffic);
+                        traffic_clone.end_time = Some(OffsetDateTime::now_utc());
+                        traffic_clone.set_transaction_state(TransactionState::Requesting);
+
+                        // 将修改后的 Traffic 包装回 Arc
+                        traffic = Arc::new(traffic_clone);
+                    }
+
+                    // 如果有head，创建流量头
+                    if let Some(hd) = head {
+                        match self
+                            .state
+                            .create_traffic_head(&traffic, hd.id, current_session)
+                            .await
+                        {
+                            Ok(new_head) => head = Some(new_head),
+                            Err(err) => {
+                                return self.internal_server_error(err, traffic, None).await
+                            }
+                        }
+                    }
+                }
+                Err(err) => return self.internal_server_error(err, traffic, None).await,
+            };
+        } else {
+            // 非监控模式下，处理请求体并继续
+            let req_body_file = if traffic.valid {
+                match self.req_body_file(traffic.clone()) {
+                    Ok((file, t)) => {
+                        traffic = t;
+                        Some(file)
+                    }
+                    Err(err) => return self.internal_server_error(err, traffic, None).await,
+                }
+            } else {
+                None
+            };
+            let req_body = BodyWrapper::new(req.into_body(), req_body_file, None, Some(headers));
+            return self.continue_request(req_body, traffic, None).await;
+        }
+        let breakpoints_config = self.get_breakpoints_config();
+
+        // 继续处理
+        let header_breakpoint_result = self
+            .state
+            .check_breakpoints(breakpoints_config, &traffic, String::from("request"))
+            .await;
+        let head_id = head.map(|hd| hd.id);
+
+        match header_breakpoint_result {
+            Some((breakpoints, match_result)) => {
+                match match_result {
+                    BreakpointMatchResult::HeaderOnlyMatch => {
+                        let (req_body_bytes, req_body_content, content_encoding) = match self
+                            .get_body_data(Some(req.into_body()), None, traffic.clone())
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(err) => {
+                                return self.internal_server_error(err, traffic, head_id).await;
+
+                                //  self.internal_server_error(err, traffic, head_id).await;
+                            }
+                        };
+                        {
+                            let mut traffic_clone = Traffic::clone(&traffic);
+                            traffic_clone.req_body_hex =
+                                Some(bytes_to_hex_structs(&req_body_bytes));
+                            // 将修改后的 Traffic 包装回 Arc
+                            traffic = Arc::new(traffic_clone);
+                        }
+                        // 检查请求体是否匹配
+                        if self
+                            .state
+                            .check_body_breakpoints(
+                                req_body_content,
+                                breakpoints,
+                                String::from("request"),
+                            )
+                            .await
+                        {
+                            return self
+                                .handle_request_breakpoint_and_pause(
+                                    traffic,
+                                    req_body_bytes,
+                                    content_encoding,
+                                    head_id,
+                                )
+                                .await;
+                        } else {
+                            let req_body_file = if traffic.valid {
+                                match self.req_body_file(traffic.clone()) {
+                                    Ok((file, t)) => {
+                                        traffic = t;
+                                        Some(file)
+                                    }
+                                    Err(err) => {
+                                        return self
+                                            .internal_server_error(err, traffic, head_id)
+                                            .await;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
+                            let req_body = BodyWrapper::new(
+                                Full::new(req_body_bytes.clone()),
+                                req_body_file,
+                                None,
+                                Some(headers),
+                            );
+                            return self.continue_request(req_body, traffic, head_id).await;
+                        }
+                    }
+                    BreakpointMatchResult::FullMatch => {
+                        let (req_body_bytes, _, content_encoding) = match self
+                            .get_body_data(Some(req.into_body()), None, traffic.clone())
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(err) => {
+                                return self.internal_server_error(err, traffic, head_id).await;
+                            }
+                        };
+
+                        {
+                            let mut traffic_clone = Traffic::clone(&traffic);
+                            traffic_clone.req_body_hex =
+                                Some(bytes_to_hex_structs(&req_body_bytes));
+                            // 将修改后的 Traffic 包装回 Arc
+                            traffic = Arc::new(traffic_clone);
+                        }
+                        return self
+                            .handle_request_breakpoint_and_pause(
+                                traffic,
+                                req_body_bytes,
+                                content_encoding,
+                                head_id,
+                            )
+                            .await;
+                    }
+                    _ => {
+                        // 没有匹配，直接转发
+                        let req_body_file = if traffic.valid {
+                            match self.req_body_file(traffic.clone()) {
+                                Ok((file, t)) => {
+                                    traffic = t;
+                                    Some(file)
+                                }
+                                Err(err) => {
+                                    return self.internal_server_error(err, traffic, head_id).await;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        match self.get_body_bytes(Some(req.into_body())).await {
+                            Ok(bytes) => {
+                                let hex_structs = bytes_to_hex_structs(&bytes);
+                                // 设置 16进制数据
+                                {
+                                    let mut traffic_clone = Traffic::clone(&traffic);
+                                    traffic_clone.req_body_hex = Some(hex_structs);
+                                    // 将修改后的 Traffic 包装回 Arc
+                                    traffic = Arc::new(traffic_clone);
+                                }
+
+                                let req_body = BodyWrapper::new(
+                                    Full::new(bytes.clone()),
+                                    req_body_file,
+                                    None,
+                                    Some(headers),
+                                );
+                                return self.continue_request(req_body, traffic, head_id).await;
+                            }
+                            Err(e) => {
+                                return self.internal_server_error(e, traffic, head_id).await;
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                let req_body_file = if traffic.valid {
+                    match self.req_body_file(traffic.clone()) {
+                        Ok((file, t)) => {
+                            traffic = t;
+                            Some(file)
+                        }
+                        Err(err) => {
+                            return self.internal_server_error(err, traffic, head_id).await;
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                // let req_body = BodyWrapper::new(req.into_body(), req_body_file, None);
+                // debug!("流量没有进入断点：{:?}", traffic.uri);
+
+                // debug!("req.into_body(){:?}", req.into_body());
+
+                match self.get_body_bytes(Some(req.into_body())).await {
+                    Ok(bytes) => {
+                        // debug!("正在获取请求体...");
+
+                        let hex_structs = bytes_to_hex_structs(&bytes);
+                        // 设置 16进制数据
+                        {
+                            let mut traffic_clone = Traffic::clone(&traffic);
+                            traffic_clone.req_body_hex = Some(hex_structs);
+                            traffic = Arc::new(traffic_clone);
+                        }
+
+                        let req_body = BodyWrapper::new(
+                            Full::new(bytes.clone()),
+                            req_body_file,
+                            None,
+                            Some(headers),
+                        );
+                        // debug!("16进制设置完成");
+                        return self.continue_request(req_body, traffic, head_id).await;
+                    }
+                    Err(e) => {
+                        debug!("获取请求体字节异常{:?}", e);
+                        return self.internal_server_error(e, traffic, head_id).await;
+                    }
+                }
+            }
+        }
+    }
+
+    // 返回 407 Proxy Authentication Required
+    pub fn create_auth_required_response(&self) -> Response {
+        let mut response = Response::new(
+            BoxBody::new(Full::new(Bytes::new()))
+                .map_err(|_: Infallible| anyhow::Error::msg("Empty body"))
+                .boxed(),
+        );
+        *response.status_mut() = StatusCode::PROXY_AUTHENTICATION_REQUIRED;
+        response.headers_mut().insert(
+            "Proxy-Authenticate",
+            HeaderValue::from_static("Basic realm=\"Proxy\""),
+        );
+        debug!("Proxy authentication required");
+        return response;
+    }
+
+    pub fn validate_proxy_credentials(&self, username: &str, password: &str) -> bool {
+        debug!("username:{:?}, password:{:?}", username, password);
+        if !username.is_empty() && !password.is_empty() {
+            return true;
+        }
+        false
     }
 
     pub fn get_breakpoints_config(&self) -> BreakpointsConfig {
@@ -421,9 +842,13 @@ impl Server {
 
         if let Ok(map_local) = get_map_local_config(&self.app_handle) {
             // debug!("map_local:{:?}", map_local);
-            if let Ok(item) = check_need_map_local(map_local) {
+            if let Ok(item) = check_need_map_local(map_local, &traffic.uri) {
                 // 检查是否需要MapLocal
-                // debug!("item:{:?}", item);
+                // debug!(
+                //     "traffic.uri:{:?} ,item.uri:{:?}",
+                //     traffic.uri,
+                //     item.url.clone()
+                // );
                 if traffic.uri.contains(&item.url) {
                     // debug!("匹配到MapLocal规则");
                     let mut res = Response::default();
@@ -529,51 +954,83 @@ impl Server {
             }
         }
 
-        // 获取代理配置并检查是否需要使用代理
-        match get_proxy_config(&self.app_handle) {
-            Ok(proxy_config) => {
-                let mut builder = hyper::Request::builder().uri(&traffic.uri).method(method);
+        let mut builder = hyper::Request::builder().uri(&traffic.uri).method(method);
 
-                if let Some(req_headers) = &traffic.req_headers {
-                    for header in &req_headers.items {
-                        builder = builder.header(&header.name, &header.value);
-                    }
-                }
-
-                let proxy_req = match builder.body(bytes) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        return self.internal_server_error(err, traffic, head_id).await;
-                    }
-                };
-
-                let https = HttpsConnectorBuilder::new()
-                    .with_webpki_roots()
-                    .https_or_http()
-                    .enable_all_versions()
-                    .build();
-
-                let need_proxy = check_proxy_config(&proxy_config, traffic.uri.clone());
-                debug!("need_proxy={}", need_proxy);
-                if need_proxy {
-                    self.send_request_with_proxy(&proxy_config, https, proxy_req, traffic, head_id)
-                        .await
-                } else {
-                    self.send_request_direct(https, proxy_req, traffic, head_id)
-                        .await
-                }
-            }
-            Err(err) => {
-                error!("Failed to get proxy config: {}", err);
-                return self.internal_server_error(err, traffic, head_id).await;
+        if let Some(req_headers) = &traffic.req_headers {
+            for header in &req_headers.items {
+                builder = builder.header(&header.name, &header.value);
             }
         }
+
+        let proxy_req = match builder.body(bytes) {
+            Ok(v) => v,
+            Err(err) => {
+                return self.internal_server_error(err, traffic, head_id).await;
+            }
+        };
+
+        let https = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_all_versions()
+            .build();
+
+        self.send_request_with_proxy(https, proxy_req, traffic, head_id)
+            .await
+
+        // debug!("need_proxy={}", need_proxy);
+        // if need_proxy {
+        //     self.send_request_with_proxy(&proxy_config, https, proxy_req, traffic, head_id)
+        //         .await
+        // } else {
+        //     self.send_request_direct(https, proxy_req, traffic, head_id)
+        //         .await
+        // }
+        // 获取代理配置并检查是否需要使用代理
+        // match get_proxy_config(&self.app_handle) {
+        //     Ok(proxy_config) => {
+        //         let mut builder = hyper::Request::builder().uri(&traffic.uri).method(method);
+
+        //         if let Some(req_headers) = &traffic.req_headers {
+        //             for header in &req_headers.items {
+        //                 builder = builder.header(&header.name, &header.value);
+        //             }
+        //         }
+
+        //         let proxy_req = match builder.body(bytes) {
+        //             Ok(v) => v,
+        //             Err(err) => {
+        //                 return self.internal_server_error(err, traffic, head_id).await;
+        //             }
+        //         };
+
+        //         let https = HttpsConnectorBuilder::new()
+        //             .with_webpki_roots()
+        //             .https_or_http()
+        //             .enable_all_versions()
+        //             .build();
+
+        //         let need_proxy = check_proxy_config(&proxy_config, traffic.uri.clone());
+        //         debug!("need_proxy={}", need_proxy);
+        //         if need_proxy {
+        //             self.send_request_with_proxy(&proxy_config, https, proxy_req, traffic, head_id)
+        //                 .await
+        //         } else {
+        //             self.send_request_direct(https, proxy_req, traffic, head_id)
+        //                 .await
+        //         }
+        //     }
+        //     Err(err) => {
+        //         error!("Failed to get proxy config: {}", err);
+        //         return self.internal_server_error(err, traffic, head_id).await;
+        //     }
+        // }
     }
 
     // 使用代理发送请求
     async fn send_request_with_proxy<B>(
         &self,
-        proxy_config: &ExternalProxy,
+        // proxy_config: &ExternalProxy,
         https: HttpsConnector<HttpConnector>,
         mut proxy_req: hyper::Request<B>,
         traffic: Arc<Traffic>,
@@ -586,37 +1043,53 @@ impl Server {
     {
         let uri: Uri = traffic.uri.parse().unwrap();
         let proxy = {
-            let mutable_external_proxy_configuration = &proxy_config
-                .configurations
-                .entry
-                .iter()
-                .find(|entry| entry.string == proxy_config.proxy_type)
-                .unwrap()
-                .mutable_external_proxy_configuration;
-            debug!(
-                "mutable_external_proxy_configuration={:?}",
-                mutable_external_proxy_configuration
-            );
-            let host = &mutable_external_proxy_configuration.host;
+            // let mutable_external_proxy_configuration = &proxy_config
+            //     .configurations
+            //     .entry
+            //     .iter()
+            //     .find(|entry| entry.string == proxy_config.proxy_type)
+            //     .unwrap()
+            //     .mutable_external_proxy_configuration;
+            // debug!(
+            //     "mutable_external_proxy_configuration={:?}",
+            //     mutable_external_proxy_configuration
+            // );
+            let proxy_auth_guard = self.proxy_auth.lock().await;
+            if proxy_auth_guard.is_none() {
+                return self
+                    .internal_server_error("Proxy authentication is required", traffic, head_id)
+                    .await;
+            }
 
-            let port = mutable_external_proxy_configuration.port;
+            let proxy_auth = proxy_auth_guard.as_ref().unwrap();
+            let encrypted_username = proxy_auth.username.clone();
+            let password = proxy_auth.password.clone();
 
-            let proxy_uri: Uri = format!("http://{}:{}", host, port).parse().unwrap();
+            let (host, username) = {
+                let encrypted_username_parts: Vec<&str> = encrypted_username.split('|').collect();
+                if encrypted_username_parts.len() != 2 {
+                    return self
+                        .internal_server_error("Invalid format", traffic, head_id)
+                        .await;
+                }
+                let (encrypted_host, username) =
+                    (encrypted_username_parts[0], encrypted_username_parts[1]);
+                if encrypted_host.is_empty() || username.is_empty() {
+                    return self
+                        .internal_server_error("Invalid format", traffic, head_id)
+                        .await;
+                }
+                let host = encrypted_host.replace("+", ":");
+
+                (host, username)
+            };
+            debug!("host={:?}, username={:?}", host, username);
+
+            let proxy_uri: Uri = format!("http://{}", host).parse().unwrap();
             let mut proxy = Proxy::new(Intercept::All, proxy_uri.clone());
 
-            if mutable_external_proxy_configuration.requires_authentication {
-                let username = &mutable_external_proxy_configuration.username;
-                let encrypted_password = &mutable_external_proxy_configuration.encrypted_password;
+            proxy.set_authorization(Authorization::basic(&username, &password));
 
-                let decrypted_password = match CRYPTO_SERVICE.decrypt(encrypted_password) {
-                    Ok(decrypted_text) => decrypted_text,
-                    Err(e) => {
-                        return self.internal_server_error(e, traffic, head_id).await;
-                    }
-                };
-
-                proxy.set_authorization(Authorization::basic(username, &decrypted_password));
-            }
             proxy
         };
 
@@ -910,281 +1383,6 @@ impl Server {
         Ok((body_bytes, body_content, content_encoding))
     }
 
-    async fn handle(self: Arc<Self>, req: Request) -> Result<Response, hyper::Error> {
-        let req_uri = req.uri().to_string();
-        let headers = req.headers().clone();
-        let method = req.method().clone();
-        let uri = if !req_uri.starts_with('/') {
-            req_uri.clone()
-        } else {
-            let mut res = Response::default();
-            *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-            set_res_body(&mut res, "No reserver proxy url");
-            return Ok(res);
-        };
-
-        // 先创建普通的 Traffic 对象
-        let mut traffic_obj = Traffic::new(&uri, method.as_str());
-
-        let mut head: Option<TrafficHead>;
-
-        // 基础检查和设置
-        traffic_obj.set_start_time();
-        traffic_obj.check_match();
-        traffic_obj.set_req_headers(req.headers());
-
-        // 设置完成后再包装到 Arc 中
-        let mut traffic = Arc::new(traffic_obj);
-
-        if method == Method::CONNECT {
-            return self.handle_connect(req, traffic);
-        }
-        let current_session = self.state.get_current_session();
-        // 根据 monitor_traffic 状态处理
-        if self.state.is_monitor_traffic().await {
-            // 只有在监控模式下才需要 add_traffic
-            debug!("监控模式下，添加流量");
-            match self
-                .state
-                .add_traffic(traffic.clone(), &current_session)
-                .await
-            {
-                Ok(traffic_head) => {
-                    head = Some(traffic_head);
-                    {
-                        let mut traffic_clone = Traffic::clone(&traffic);
-                        traffic_clone.end_time = Some(OffsetDateTime::now_utc());
-                        traffic_clone.set_transaction_state(TransactionState::Requesting);
-
-                        // 将修改后的 Traffic 包装回 Arc
-                        traffic = Arc::new(traffic_clone);
-                    }
-
-                    // 如果有head，创建流量头
-                    if let Some(hd) = head {
-                        match self
-                            .state
-                            .create_traffic_head(&traffic, hd.id, current_session)
-                            .await
-                        {
-                            Ok(new_head) => head = Some(new_head),
-                            Err(err) => {
-                                return self.internal_server_error(err, traffic, None).await
-                            }
-                        }
-                    }
-                }
-                Err(err) => return self.internal_server_error(err, traffic, None).await,
-            };
-        } else {
-            // 非监控模式下，处理请求体并继续
-            let req_body_file = if traffic.valid {
-                match self.req_body_file(traffic.clone()) {
-                    Ok((file, t)) => {
-                        traffic = t;
-                        Some(file)
-                    }
-                    Err(err) => return self.internal_server_error(err, traffic, None).await,
-                }
-            } else {
-                None
-            };
-            let req_body = BodyWrapper::new(req.into_body(), req_body_file, None, Some(headers));
-            return self.continue_request(req_body, traffic, None).await;
-        }
-        let breakpoints_config = self.get_breakpoints_config();
-
-        // 继续处理
-        let header_breakpoint_result = self
-            .state
-            .check_breakpoints(breakpoints_config, &traffic, String::from("request"))
-            .await;
-        let head_id = head.map(|hd| hd.id);
-
-        match header_breakpoint_result {
-            Some((breakpoints, match_result)) => {
-                match match_result {
-                    BreakpointMatchResult::HeaderOnlyMatch => {
-                        let (req_body_bytes, req_body_content, content_encoding) = match self
-                            .get_body_data(Some(req.into_body()), None, traffic.clone())
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(err) => {
-                                return self.internal_server_error(err, traffic, head_id).await;
-
-                                //  self.internal_server_error(err, traffic, head_id).await;
-                            }
-                        };
-                        {
-                            let mut traffic_clone = Traffic::clone(&traffic);
-                            traffic_clone.req_body_hex =
-                                Some(bytes_to_hex_structs(&req_body_bytes));
-                            // 将修改后的 Traffic 包装回 Arc
-                            traffic = Arc::new(traffic_clone);
-                        }
-                        // 检查请求体是否匹配
-                        if self
-                            .state
-                            .check_body_breakpoints(
-                                req_body_content,
-                                breakpoints,
-                                String::from("request"),
-                            )
-                            .await
-                        {
-                            return self
-                                .handle_request_breakpoint_and_pause(
-                                    traffic,
-                                    req_body_bytes,
-                                    content_encoding,
-                                    head_id,
-                                )
-                                .await;
-                        } else {
-                            let req_body_file = if traffic.valid {
-                                match self.req_body_file(traffic.clone()) {
-                                    Ok((file, t)) => {
-                                        traffic = t;
-                                        Some(file)
-                                    }
-                                    Err(err) => {
-                                        return self
-                                            .internal_server_error(err, traffic, head_id)
-                                            .await;
-                                    }
-                                }
-                            } else {
-                                None
-                            };
-
-                            let req_body = BodyWrapper::new(
-                                Full::new(req_body_bytes.clone()),
-                                req_body_file,
-                                None,
-                                Some(headers),
-                            );
-                            return self.continue_request(req_body, traffic, head_id).await;
-                        }
-                    }
-                    BreakpointMatchResult::FullMatch => {
-                        let (req_body_bytes, _, content_encoding) = match self
-                            .get_body_data(Some(req.into_body()), None, traffic.clone())
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(err) => {
-                                return self.internal_server_error(err, traffic, head_id).await;
-                            }
-                        };
-
-                        {
-                            let mut traffic_clone = Traffic::clone(&traffic);
-                            traffic_clone.req_body_hex =
-                                Some(bytes_to_hex_structs(&req_body_bytes));
-                            // 将修改后的 Traffic 包装回 Arc
-                            traffic = Arc::new(traffic_clone);
-                        }
-                        return self
-                            .handle_request_breakpoint_and_pause(
-                                traffic,
-                                req_body_bytes,
-                                content_encoding,
-                                head_id,
-                            )
-                            .await;
-                    }
-                    _ => {
-                        // 没有匹配，直接转发
-                        let req_body_file = if traffic.valid {
-                            match self.req_body_file(traffic.clone()) {
-                                Ok((file, t)) => {
-                                    traffic = t;
-                                    Some(file)
-                                }
-                                Err(err) => {
-                                    return self.internal_server_error(err, traffic, head_id).await;
-                                }
-                            }
-                        } else {
-                            None
-                        };
-                        match self.get_body_bytes(Some(req.into_body())).await {
-                            Ok(bytes) => {
-                                let hex_structs = bytes_to_hex_structs(&bytes);
-                                // 设置 16进制数据
-                                {
-                                    let mut traffic_clone = Traffic::clone(&traffic);
-                                    traffic_clone.req_body_hex = Some(hex_structs);
-                                    // 将修改后的 Traffic 包装回 Arc
-                                    traffic = Arc::new(traffic_clone);
-                                }
-
-                                let req_body = BodyWrapper::new(
-                                    Full::new(bytes.clone()),
-                                    req_body_file,
-                                    None,
-                                    Some(headers),
-                                );
-                                return self.continue_request(req_body, traffic, head_id).await;
-                            }
-                            Err(e) => {
-                                return self.internal_server_error(e, traffic, head_id).await;
-                            }
-                        }
-                    }
-                }
-            }
-            None => {
-                let req_body_file = if traffic.valid {
-                    match self.req_body_file(traffic.clone()) {
-                        Ok((file, t)) => {
-                            traffic = t;
-                            Some(file)
-                        }
-                        Err(err) => {
-                            return self.internal_server_error(err, traffic, head_id).await;
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                // let req_body = BodyWrapper::new(req.into_body(), req_body_file, None);
-                // debug!("流量没有进入断点：{:?}", traffic.uri);
-
-                // debug!("req.into_body(){:?}", req.into_body());
-
-                match self.get_body_bytes(Some(req.into_body())).await {
-                    Ok(bytes) => {
-                        // debug!("正在获取请求体...");
-
-                        let hex_structs = bytes_to_hex_structs(&bytes);
-                        // 设置 16进制数据
-                        {
-                            let mut traffic_clone = Traffic::clone(&traffic);
-                            traffic_clone.req_body_hex = Some(hex_structs);
-                            traffic = Arc::new(traffic_clone);
-                        }
-
-                        let req_body = BodyWrapper::new(
-                            Full::new(bytes.clone()),
-                            req_body_file,
-                            None,
-                            Some(headers),
-                        );
-                        // debug!("16进制设置完成");
-                        return self.continue_request(req_body, traffic, head_id).await;
-                    }
-                    Err(e) => {
-                        debug!("获取请求体字节异常{:?}", e);
-                        return self.internal_server_error(e, traffic, head_id).await;
-                    }
-                }
-            }
-        }
-    }
-
     // async fn handle_cert_index(&self, res: &mut Response, path: &str) -> Result<()> {
     //     if path.is_empty() {
     //         set_res_body(res, CERT_INDEX);
@@ -1264,6 +1462,7 @@ impl Server {
         self: Arc<Self>,
         mut req: Request,
         traffic: Arc<Traffic>,
+        addr: SocketAddr,
     ) -> Result<Response, hyper::Error> {
         let mut res = Response::default();
         let authority = match req.uri().authority().cloned() {
@@ -1277,6 +1476,7 @@ impl Server {
         let mut traffic_clone = Traffic::clone(&traffic);
 
         let fut = async move {
+            debug!("req.uri(): {:?}", req.uri());
             match hyper::upgrade::on(&mut req).await {
                 Ok(upgraded) => {
                     let mut upgraded = TokioIo::new(upgraded);
@@ -1299,14 +1499,38 @@ impl Server {
                     );
                     if buffer == *b"GET " {
                         if let Err(err) = self
-                            .serve_connect_stream(upgraded, Scheme::HTTP, authority)
+                            .serve_connect_stream(upgraded, Scheme::HTTP, authority, addr)
                             .await
                         {
                             traffic_clone.add_error(format!(
                                 "Failed to read from upgraded connection: {err}"
                             ));
                         }
-                    } else if buffer[..2] == *b"\x16\x03" {
+                    }
+                    // else if req.uri().to_string() == "https://ipinfo.ipidea.io"
+                    //     || req.uri().to_string() == "ipinfo.ipidea.io:443"
+                    // {
+                    //     debug!("不解 ipinfo.ipidea.io:443");
+                    //     let mut server = match TcpStream::connect(authority.as_str()).await {
+                    //         Ok(server) => server,
+                    //         Err(err) => {
+                    //             traffic_clone
+                    //                 .add_error(format! {"Failed to connect to {authority}: {err}"});
+
+                    //             return;
+                    //         }
+                    //     };
+
+                    //     if let Err(err) =
+                    //         tokio::io::copy_bidirectional(&mut upgraded, &mut server).await
+                    //     {
+                    //         traffic_clone.add_error(format!(
+                    //             "Failed to tunnel unknown protocol to {}: {}",
+                    //             authority, err
+                    //         ));
+                    //     }
+                    // }
+                    else if buffer[..2] == *b"\x16\x03" {
                         let server_config = match self.ca.gen_server_config(&authority).await {
                             Ok(server_config) => server_config,
                             Err(err) => {
@@ -1334,7 +1558,7 @@ impl Server {
                         };
 
                         if let Err(err) = self
-                            .serve_connect_stream(stream, Scheme::HTTPS, authority)
+                            .serve_connect_stream(stream, Scheme::HTTPS, authority, addr)
                             .await
                         {
                             if !err
@@ -1386,6 +1610,11 @@ impl Server {
                 .state
                 .add_traffic(Arc::new(traffic_clone), &current_session)
                 .await;
+
+            {
+                let mut connection_pool = server.connection_pool.lock().await;
+                connection_pool.remove(&addr);
+            }
         };
 
         tokio::spawn(fut);
@@ -1397,6 +1626,7 @@ impl Server {
         stream: I,
         scheme: Scheme,
         authority: Authority,
+        addr: SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error + Sync + Send>>
     where
         I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1416,7 +1646,7 @@ impl Server {
                 req = Request::from_parts(parts, body);
             };
 
-            self.clone().handle(req)
+            self.clone().handle(req, addr)
         });
 
         hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
