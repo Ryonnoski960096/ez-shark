@@ -7,6 +7,7 @@
       contenteditable="true"
       v-if="readOnly"
       class="readonly-content"
+      style="font-size: 12px"
       v-html="readOnlyValue"
     />
     <Textarea

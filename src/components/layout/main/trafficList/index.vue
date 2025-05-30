@@ -5,7 +5,7 @@
     :data="tableData"
     :active="currentTrafficId"
     :columns="columns"
-    :row-height="28"
+    :row-height="22"
     v-model:ids="ids"
     @onCellClick="onCellClick"
     @onContextMenu="oncontextmenu"
@@ -151,11 +151,16 @@ interface TableRowData {
 const tableData = ref<TableRowData[]>([]);
 
 watch(
-  [() => trafficStore.trafficList, () => sessionStore.currentSession],
+  [
+    () => trafficStore.trafficList,
+    () => sessionStore.currentSession,
+    () => trafficStore.searchMode
+  ],
   () => {
     const list = trafficStore.isSearchMode
       ? trafficStore.searchMode
       : trafficStore.trafficList;
+    // console.log(list);
 
     if (!sessionStore.currentSession) return;
 
@@ -168,12 +173,22 @@ watch(
 
     tableData.value = Array.from(traffics.values()).map(({ uri, ...rest }) => {
       const { host, path } = parseUrlToHostPath(uri, rest.method === "CONNECT");
-      return {
-        ...rest,
-        host: host,
-        path: decodeURIComponent(path),
-        onClick: () => handleRowClick(rest.id)
-      };
+      try {
+        return {
+          ...rest,
+          host,
+          path: decodeURIComponent(path),
+          onClick: () => handleRowClick(rest.id)
+        };
+      } catch {
+        // console.error("decodeURIComponent failed on path:", path);
+        return {
+          ...rest,
+          host,
+          path, // 直接用未解码的path，或用替代方案
+          onClick: () => handleRowClick(rest.id)
+        };
+      }
     });
   },
   {
@@ -435,7 +450,6 @@ watch(
       eventBus.emit("change:trafficDetail", null);
       return;
     }
-
     if (id && id !== 0) {
       // if (!sessionStore.currentSession) return;
 
@@ -447,6 +461,7 @@ watch(
       const traffic = currentSessionTraffics.get(id);
       if (!traffic) return;
       const res = await queryTrafficDetail(traffic.id);
+      // console.log(res);
       trafficStore.trafficDetail = res;
       eventBus.emit("change:trafficDetail", trafficStore.trafficDetail);
     }

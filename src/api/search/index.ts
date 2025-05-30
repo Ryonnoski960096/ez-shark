@@ -9,3 +9,10 @@ export async function search(data: SearchQuery, sessionId: string) {
     sessionId
   });
 }
+
+export async function ezSearch(keyword: string, sessionId: string) {
+  return ipc.invoke<number[]>("ez_search", {
+    keyword,
+    sessionId
+  });
+}

@@ -163,7 +163,7 @@ const onSearch = async () => {
   const store = await settingStore.store;
   currentSession.value = await store.get<string>("currentSession");
   const res = await search(findData.value, currentSession.value ?? "");
-
+  // console.log(res);
   keyword.value = res.text;
 
   const highlightFirstOccurrence = (
@@ -183,14 +183,18 @@ const onSearch = async () => {
       </>
     );
   };
-
+  // console.log(res.search_data);
   // 基于 keyword_byte_index 数组生成 children
   tableData.value = res.search_data.map((item) => ({
     id: item.id,
     url: item.url,
     children: item.search_item.flatMap((searchItem, searchItemIndex) => {
       const searchItemContent = searchItem.content;
-
+      // console.log(
+      //   "searchItemContent",
+      //   searchItemContent,
+      //   searchItem.keyword_byte_index
+      // );
       // 基于 keyword_byte_index 数组的长度创建子项
       return searchItem.keyword_byte_index.map((byteIndex, indexPos) => {
         const content = highlightFirstOccurrence(
@@ -207,6 +211,8 @@ const onSearch = async () => {
       });
     })
   }));
+
+  // console.log("tableData", tableData.value);
 
   currentPage.value = 1; // 搜索后重置到第一页
 

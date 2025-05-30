@@ -5,6 +5,7 @@
     @paste.prevent
     contenteditable="true"
     v-html="readOnlyValue"
+    style="font-size: 12px"
     v-if="readOnly"
   />
   <JsonEditorVue
@@ -12,6 +13,7 @@
     ref="jsonEditorVueRef"
     :readOnly="readOnly"
     v-model="value"
+    style="font-size: 12px"
     v-bind="JsonEditorVueProps"
   />
 </template>
@@ -66,6 +68,7 @@ const isHighlighting = ref<boolean>(false);
  * @returns 格式化后的HTML字符串
  */
 const formatValue = (newValue: string): string => {
+  // console.log("formatValue", newValue);
   formatting.value = true;
 
   // 保存原始JSON文本以便后续使用
@@ -328,6 +331,7 @@ const highlight = async (activeTraffic: ActiveTraffic): Promise<void> => {
     const isSpecialChar = /[{}[\]",:0-9]|true|false|null/g.test(
       activeTraffic.keyword
     );
+    // console.log("previousHighlight", previousHighlight);
 
     // 如果已经有高亮元素，我们需要使用不同的策略
     if (previousHighlight) {

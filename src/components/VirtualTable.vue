@@ -63,7 +63,7 @@
           >
             <!-- :title="getTooltipContent(String(item[column.key]))" -->
             <div
-              :title="String(item[column.key])"
+              :title="String(item[column.key]).replace(/<[^>]*>/g, '')"
               v-for="(column, index) in localColumns"
               :key="column.key + '-' + index + '-cell' + item.id"
               class="cell"
@@ -716,11 +716,11 @@ defineExpose({
 }
 
 .header-cell {
-  padding: 12px 15px;
+  padding: 8px 10px;
   font-weight: 600;
   color: #333;
   text-transform: uppercase;
-  font-size: 12px;
+  font-size: 10px;
   letter-spacing: 0.5px;
   border-right: 1px solid #e0e0e0;
   position: relative;
@@ -796,12 +796,12 @@ defineExpose({
 }
 
 .cell {
-  padding: 12px 15px;
+  padding: 6px 8px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   text-align: left;
-  font-size: 14px;
+  font-size: 11px;
   color: #495057;
   /* border-right: 1px solid #f1f3f5; */
   /* flex: 1; */
@@ -852,7 +852,7 @@ defineExpose({
 }
 
 .sort-icon {
-  font-size: 12px;
+  font-size: 11px;
   color: #666;
 }
 
