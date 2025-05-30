@@ -396,7 +396,8 @@ impl Server {
         &self,
         bytes: B,
         mut traffic: Arc<Traffic>,
-        head_id: Option<usize>,
+        head_id: Option<u64>,
+        session_id: String,
     ) -> Result<Response, hyper::Error>
     where
         B: Body + Send + Unpin + 'static,
@@ -494,34 +495,16 @@ impl Server {
                         BodyWrapper::new(
                             body,
                             body_file,
+                            traffic.res_body_file.clone(),
                             Some((head_id, self.state.clone())),
                             Some(res.headers().clone()),
                         )
                     };
                     *res.body_mut() = BoxBody::new(res_body);
                     if let Some(hd_id) = head_id {
-                        let current_session = self.state.get_current_session();
                         traffic = Arc::new(traffic_clone);
-                        // 获取session的写锁
-                        let sessions = self.state.session.read().await;
 
-                        // 获取当前会话
-                        let session_traffics: &Mutex<indexmap::IndexMap<usize, Arc<Traffic>>> =
-                            match sessions.get(&current_session) {
-                                Some(st) => st,
-                                None => {
-                                    error!("Session {} not found", current_session);
-                                    return self
-                                        .internal_server_error("", traffic, Some(hd_id))
-                                        .await;
-                                }
-                            };
-                        let mut traffics = session_traffics.lock().await;
-                        if let Some(existing_traffic) = traffics.get_mut(&hd_id) {
-                            *existing_traffic = traffic.clone();
-                        } else {
-                            error!("Traffic not found in session");
-                        }
+                        self.state.traffics.insert(hd_id, traffic).await;
                     }
                     // debug!("返回伪造响应");
                     return Ok(res);
@@ -556,10 +539,17 @@ impl Server {
                 let need_proxy = check_proxy_config(&proxy_config, traffic.uri.clone());
                 debug!("need_proxy={}", need_proxy);
                 if need_proxy {
-                    self.send_request_with_proxy(&proxy_config, https, proxy_req, traffic, head_id)
-                        .await
+                    self.send_request_with_proxy(
+                        &proxy_config,
+                        https,
+                        proxy_req,
+                        traffic,
+                        head_id,
+                        session_id,
+                    )
+                    .await
                 } else {
-                    self.send_request_direct(https, proxy_req, traffic, head_id)
+                    self.send_request_direct(https, proxy_req, traffic, head_id, session_id)
                         .await
                 }
             }
@@ -577,7 +567,8 @@ impl Server {
         https: HttpsConnector<HttpConnector>,
         mut proxy_req: hyper::Request<B>,
         traffic: Arc<Traffic>,
-        head_id: Option<usize>,
+        head_id: Option<u64>,
+        session_id: String,
     ) -> Result<Response, hyper::Error>
     where
         B: Body + Send + Unpin + 'static,
@@ -632,7 +623,7 @@ impl Server {
             }
         }
 
-        self.send_and_process_request(client, proxy_req, traffic, head_id)
+        self.send_and_process_request(client, proxy_req, traffic, head_id, session_id)
             .await
     }
 
@@ -642,7 +633,8 @@ impl Server {
         https: HttpsConnector<HttpConnector>,
         proxy_req: hyper::Request<B>,
         traffic: Arc<Traffic>,
-        head_id: Option<usize>,
+        head_id: Option<u64>,
+        session_id: String,
     ) -> Result<Response, hyper::Error>
     where
         B: Body + Send + Unpin + 'static,
@@ -653,7 +645,7 @@ impl Server {
             .pool_idle_timeout(Duration::from_secs(30))
             .build(https);
 
-        self.send_and_process_request(client, proxy_req, traffic, head_id)
+        self.send_and_process_request(client, proxy_req, traffic, head_id, session_id)
             .await
     }
 
@@ -663,7 +655,8 @@ impl Server {
         client: Client<C, B>,
         req: hyper::Request<B>,
         traffic: Arc<Traffic>,
-        head_id: Option<usize>,
+        head_id: Option<u64>,
+        session_id: String,
     ) -> Result<Response, hyper::Error>
     where
         C: Connect + Clone + Send + Sync + 'static,
@@ -679,11 +672,10 @@ impl Server {
             traffic_clone.end_time = Some(OffsetDateTime::now_utc());
             traffic_clone.set_transaction_state(TransactionState::Responding);
 
-            let current_session = self.state.get_current_session();
             // 使用克隆后的 Traffic 创建 traffic_head
             let _ = self
                 .state
-                .create_traffic_head(&traffic_clone, hd_id, current_session)
+                .create_traffic_head(&traffic_clone, hd_id, session_id.clone())
                 .await;
         }
 
@@ -695,7 +687,8 @@ impl Server {
             }
         };
 
-        self.process_proxy_res(proxy_res, traffic, head_id).await
+        self.process_proxy_res(proxy_res, traffic, head_id, session_id)
+            .await
     }
 
     // 断点处理和暂停方法
@@ -704,7 +697,8 @@ impl Server {
         mut traffic: Arc<Traffic>,
         mut body_bytes: Bytes,
         content_encoding: String,
-        head_id: Option<usize>,
+        head_id: Option<u64>,
+        session_id: String,
         // traffic_done_tx: TrafficDoneSender
     ) -> Result<Response, hyper::Error> {
         let id = Uuid::new_v4().to_string();
@@ -810,8 +804,16 @@ impl Server {
             None
         };
 
-        let req_body = BodyWrapper::new(Full::new(body_bytes.clone()), req_body_file, None, None);
-        return self.continue_request(req_body, traffic, head_id).await;
+        let req_body = BodyWrapper::new(
+            Full::new(body_bytes.clone()),
+            req_body_file,
+            traffic.req_body_file.clone(),
+            None,
+            None,
+        );
+        return self
+            .continue_request(req_body, traffic, head_id, session_id)
+            .await;
     }
 
     async fn get_body_bytes<B>(&self, body: Option<B>) -> Result<Bytes, String>
@@ -922,9 +924,9 @@ impl Server {
             set_res_body(&mut res, "No reserver proxy url");
             return Ok(res);
         };
-
+        let current_session = self.state.get_current_session();
         // 先创建普通的 Traffic 对象
-        let mut traffic_obj = Traffic::new(&uri, method.as_str());
+        let mut traffic_obj = Traffic::new(&uri, method.as_str(), &current_session);
 
         let mut head: Option<TrafficHead>;
 
@@ -939,7 +941,7 @@ impl Server {
         if method == Method::CONNECT {
             return self.handle_connect(req, traffic);
         }
-        let current_session = self.state.get_current_session();
+
         // 根据 monitor_traffic 状态处理
         if self.state.is_monitor_traffic().await {
             // 只有在监控模式下才需要 add_traffic
@@ -964,7 +966,7 @@ impl Server {
                     if let Some(hd) = head {
                         match self
                             .state
-                            .create_traffic_head(&traffic, hd.id, current_session)
+                            .create_traffic_head(&traffic, hd.id, current_session.clone())
                             .await
                         {
                             Ok(new_head) => head = Some(new_head),
@@ -989,8 +991,16 @@ impl Server {
             } else {
                 None
             };
-            let req_body = BodyWrapper::new(req.into_body(), req_body_file, None, Some(headers));
-            return self.continue_request(req_body, traffic, None).await;
+            let req_body = BodyWrapper::new(
+                req.into_body(),
+                req_body_file,
+                traffic.req_body_file.clone(),
+                None,
+                Some(headers),
+            );
+            return self
+                .continue_request(req_body, traffic, None, current_session)
+                .await;
         }
         let breakpoints_config = self.get_breakpoints_config();
 
@@ -1039,6 +1049,7 @@ impl Server {
                                     req_body_bytes,
                                     content_encoding,
                                     head_id,
+                                    current_session,
                                 )
                                 .await;
                         } else {
@@ -1061,10 +1072,13 @@ impl Server {
                             let req_body = BodyWrapper::new(
                                 Full::new(req_body_bytes.clone()),
                                 req_body_file,
+                                traffic.req_body_file.clone(),
                                 None,
                                 Some(headers),
                             );
-                            return self.continue_request(req_body, traffic, head_id).await;
+                            return self
+                                .continue_request(req_body, traffic, head_id, current_session)
+                                .await;
                         }
                     }
                     BreakpointMatchResult::FullMatch => {
@@ -1091,6 +1105,7 @@ impl Server {
                                 req_body_bytes,
                                 content_encoding,
                                 head_id,
+                                current_session,
                             )
                             .await;
                     }
@@ -1123,10 +1138,13 @@ impl Server {
                                 let req_body = BodyWrapper::new(
                                     Full::new(bytes.clone()),
                                     req_body_file,
+                                    traffic.req_body_file.clone(),
                                     None,
                                     Some(headers),
                                 );
-                                return self.continue_request(req_body, traffic, head_id).await;
+                                return self
+                                    .continue_request(req_body, traffic, head_id, current_session)
+                                    .await;
                             }
                             Err(e) => {
                                 return self.internal_server_error(e, traffic, head_id).await;
@@ -1170,11 +1188,14 @@ impl Server {
                         let req_body = BodyWrapper::new(
                             Full::new(bytes.clone()),
                             req_body_file,
+                            traffic.req_body_file.clone(),
                             None,
                             Some(headers),
                         );
                         // debug!("16进制设置完成");
-                        return self.continue_request(req_body, traffic, head_id).await;
+                        return self
+                            .continue_request(req_body, traffic, head_id, current_session)
+                            .await;
                     }
                     Err(e) => {
                         debug!("获取请求体字节异常{:?}", e);
@@ -1184,81 +1205,6 @@ impl Server {
             }
         }
     }
-
-    // async fn handle_cert_index(&self, res: &mut Response, path: &str) -> Result<()> {
-    //     if path.is_empty() {
-    //         set_res_body(res, CERT_INDEX);
-    //         res.headers_mut().insert(
-    //             CONTENT_TYPE,
-    //             HeaderValue::from_static("text/html; charset=UTF-8"),
-    //         );
-    //     } else if path == "proxyfor-ca-cert.cer" || path == "proxyfor-ca-cert.pem" {
-    //         let body = self.ca.ca_cert_pem();
-    //         set_res_body(res, body);
-    //         res.headers_mut().insert(
-    //             CONTENT_TYPE,
-    //             HeaderValue::from_static("application/x-x509-ca-cert"),
-    //         );
-    //         res.headers_mut().insert(
-    //             CONTENT_DISPOSITION,
-    //             HeaderValue::from_str(&format!(r#"attachment; filename="{path}""#))?,
-    //         );
-    //     } else {
-    //         *res.status_mut() = StatusCode::NOT_FOUND;
-    //     }
-    //     Ok(())
-    // }
-    // async fn handle_subscribe_traffics(&self, res: &mut Response) -> Result<()> {
-    //     let (init_data, receiver) = (
-    //         self.state.list_heads().await,
-    //         self.state.subscribe_traffics(),
-    //     );
-    //     let stream = BroadcastStream::new(receiver);
-    //     let stream = stream
-    //         .map_ok(|head| ndjson_frame(&head))
-    //         .map_err(|err| anyhow!("{err}"));
-    //     let body = if init_data.is_empty() {
-    //         BodyExt::boxed(StreamBody::new(stream))
-    //     } else {
-    //         let init_stream =
-    //             stream::iter(init_data.into_iter().map(|head| Ok(ndjson_frame(&head))));
-    //         let combined_stream = init_stream.chain(stream);
-    //         BodyExt::boxed(StreamBody::new(combined_stream))
-    //     };
-    //     *res.body_mut() = body;
-    //     res.headers_mut().insert(
-    //         CONTENT_TYPE,
-    //         HeaderValue::from_static("application/x-ndjson; charset=UTF-8"),
-    //     );
-    //     res.headers_mut()
-    //         .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    //     Ok(())
-    // }
-
-    // async fn handle_list_traffics(&self, res: &mut Response, format: &str) -> Result<()> {
-    //     let (data, content_type) = self.state.export_all_traffics(format).await?;
-    //     set_res_body(res, data);
-    //     res.headers_mut()
-    //         .insert(CONTENT_TYPE, HeaderValue::from_str(content_type)?);
-    //     res.headers_mut()
-    //         .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    //     Ok(())
-    // }
-
-    // async fn handle_get_traffic(&self, res: &mut Response, id: &str, format: &str) -> Result<()> {
-    //     let Ok(id) = id.parse() else {
-    //         *res.status_mut() = StatusCode::BAD_REQUEST;
-    //         set_res_body(res, "Invalid id");
-    //         return Ok(());
-    //     };
-    //     let (data, content_type) = self.state.export_traffic(id, format).await?;
-    //     set_res_body(res, data);
-    //     res.headers_mut()
-    //         .insert(CONTENT_TYPE, HeaderValue::from_str(content_type)?);
-    //     res.headers_mut()
-    //         .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    //     Ok(())
-    // }
 
     fn handle_connect(
         self: Arc<Self>,
@@ -1429,7 +1375,8 @@ impl Server {
         mut traffic: Arc<Traffic>,
         mut body_bytes: Bytes,
         content_encoding: String,
-        head_id: Option<usize>,
+        head_id: Option<u64>,
+        session_id: String,
     ) -> Result<Response, hyper::Error> {
         let id = Uuid::new_v4().to_string();
         let res_body_content = TrafficBody::bytes(&body_bytes);
@@ -1531,7 +1478,7 @@ impl Server {
         body: BoxBody<Bytes, anyhow::Error>,
         mut traffic: Arc<Traffic>,
         encoding: String,
-        head_id: Option<usize>,
+        head_id: Option<u64>,
     ) -> Result<Response, hyper::Error> {
         let mut res = Response::default();
         let status_code = match StatusCode::from_u16(traffic.status.clone().unwrap()) {
@@ -1568,9 +1515,12 @@ impl Server {
             None
         };
 
+        debug!("traffic.res_body_file:{:?}", traffic.res_body_file);
+
         let res_body: BodyWrapper<BoxBody<Bytes, anyhow::Error>> = BodyWrapper::new(
             body,
             res_body_file,
+            traffic.res_body_file.clone(),
             Some((head_id, self.state.clone())),
             Some(res.headers().clone()),
         );
@@ -1590,25 +1540,8 @@ impl Server {
                     .create_traffic_head(&traffic, hd_id, current_session)
                     .await;
                 // println!("响应完成-----------------{:?}----------------------",traffic);
-                {
-                    let current_session = self.state.get_current_session();
 
-                    // 获取session的读锁
-                    let sessions = self.state.session.read().await;
-
-                    // 获取对应会话的 Mutex<IndexMap>
-                    let session_traffics = sessions.get(&current_session).unwrap_or_else(|| {
-                        // 理论上说，session_traffics一定存在
-                        panic!("Session not found: {}", current_session);
-                        // error!("Session not found: {}", current_session);
-                    });
-
-                    // 锁定特定会话的 IndexMap
-                    let mut session_traffics_locked = session_traffics.lock().await;
-
-                    // 插入流量
-                    session_traffics_locked.insert(hd_id, traffic);
-                }
+                self.state.traffics.insert(hd_id, traffic).await;
             }
             None => {}
         }
@@ -1620,7 +1553,8 @@ impl Server {
         &self,
         proxy_res: hyper::Response<T>,
         mut traffic: Arc<Traffic>,
-        head_id: Option<usize>,
+        head_id: Option<u64>,
+        session_id: String,
     ) -> Result<Response, hyper::Error> {
         // let before = time::Instant::now();
         let proxy_res = {
@@ -1714,6 +1648,7 @@ impl Server {
                                     res_body_bytes,
                                     content_encoding,
                                     head_id,
+                                    session_id,
                                 )
                                 .await;
                         } else {
@@ -1750,6 +1685,7 @@ impl Server {
                                 res_body_bytes,
                                 content_encoding,
                                 head_id,
+                                session_id,
                             )
                             .await;
                     }
@@ -1812,7 +1748,7 @@ impl Server {
         &self,
         error: T,
         mut traffic: Arc<Traffic>,
-        head_id: Option<usize>,
+        head_id: Option<u64>,
         // traffic_done_tx: TrafficDoneSender,
     ) -> Result<Response, hyper::Error> {
         let mut res = Response::default();
@@ -1870,12 +1806,19 @@ impl Server {
         let path = self
             .temp_dir
             .join(format!("{:05}-res{ext}{encoding_ext}", traffic.gid));
+        // let path = self.temp_dir.join(format!("{:05}-res{ext}", traffic.gid));
         let file = File::create(&path).with_context(|| {
             format!(
                 "Failed to create file '{}' to store response body",
                 path.display()
             )
         })?;
+        debug!(
+            "traffic.url:{},res_body_file:{},encoding:{}",
+            traffic.uri,
+            path.display(),
+            encoding
+        );
 
         let mut traffic_clone = Traffic::clone(&traffic);
         traffic_clone.set_res_body_file(&path);
@@ -1897,7 +1840,8 @@ pin_project! {
         #[pin]
         inner: B,
         file: Option<File>,
-        traffic_done: Option<(Option<usize>, Arc<State>)>,
+        file_path: Option<String>,
+        traffic_done: Option<(Option<u64>, Arc<State>)>,
         raw_size: u64,   headers: Option<HeaderMap>,
     }
      impl<B> PinnedDrop for BodyWrapper<B>
@@ -1936,8 +1880,7 @@ fn is_protobuf_content(headers: &HeaderMap) -> bool {
 }
 
 async fn decode_protobuf(data: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
-    // 使用我们的 ProtobufUnknownParser 来解析
-    let result = parse_unknown_protobuf(data).await?;
+    let result = parse_unknown_protobuf(data).await;
 
     // 将解析结果转换为 JSON
     serde_json::to_vec(&result).map_err(|e| e.into())
@@ -1947,12 +1890,14 @@ impl<B> BodyWrapper<B> {
     pub fn new(
         inner: B,
         file: Option<File>,
-        traffic_done: Option<(Option<usize>, Arc<State>)>,
+        file_path: Option<String>,
+        traffic_done: Option<(Option<u64>, Arc<State>)>,
         headers: Option<HeaderMap>,
     ) -> Self {
         Self {
             inner,
             file,
+            file_path,
             traffic_done,
             raw_size: 0,
             headers,
@@ -1987,6 +1932,7 @@ where
                                     match decode_protobuf(&data_clone).await {
                                         Ok(decoded) => {
                                             info!("成功解析 protobuf 数据");
+                                            // debug!("解析后的 protobuf 数据: {:?}", decoded);
                                             if let Err(e) = file_clone.write_all(&decoded) {
                                                 eprintln!("写入解码数据失败: {:?}", e);
                                             }
@@ -2001,9 +1947,13 @@ where
                                 });
                             } else {
                                 let _ = file.write_all(&data);
+                                let file_path = this.file_path.clone();
+                                debug!("文件路径 {:?}", file_path);
                             }
                         } else {
-                            let _ = file.write_all(&data);
+                            if let Err(e) = file.write_all(&data) {}
+                            // let file_path = this.file_path.clone();
+                            // debug!("文件路径 {:?}", file_path);
                         }
                     }
                     *this.raw_size += data.len() as u64;

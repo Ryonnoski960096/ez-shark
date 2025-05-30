@@ -3,15 +3,16 @@ use crate::utils::*;
 use anyhow::{bail, Result};
 use bytes::Bytes;
 use http::{HeaderMap, StatusCode, Version};
+use log::debug;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     path::Path,
-    sync::atomic::{self, AtomicUsize},
+    sync::atomic::{self, AtomicU64},
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-static GLOBAL_ID: AtomicUsize = AtomicUsize::new(1);
+static GLOBAL_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TransactionState {
@@ -142,7 +143,8 @@ pub fn string_to_body_hex(s: &str) -> Vec<BodyHex> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Traffic {
-    pub gid: usize,
+    pub gid: u64,
+    pub session_id: String,
     pub uri: String,
     pub method: String,
     pub transaction_state: TransactionState,
@@ -172,9 +174,10 @@ pub struct Traffic {
 }
 
 impl Traffic {
-    pub fn new(uri: &str, method: &str) -> Self {
+    pub fn new(uri: &str, method: &str, session_id: &str) -> Self {
         Self {
             gid: GLOBAL_ID.fetch_add(1, atomic::Ordering::Relaxed),
+            session_id: session_id.to_string(),
             uri: uri.to_string(),
             method: method.to_string(),
             transaction_state: TransactionState::Pending,
@@ -376,7 +379,7 @@ impl Traffic {
         }
     }
 
-    pub(crate) fn head(&self, id: usize, session_id: String) -> TrafficHead {
+    pub(crate) fn head(&self, id: u64, session_id: String) -> TrafficHead {
         TrafficHead {
             id,
             method: self.method.clone(),
@@ -481,16 +484,25 @@ impl Traffic {
     }
 
     pub(crate) async fn bodies(&self, binary_in_base64: bool) -> (Option<Body>, Option<Body>) {
+        debug!(
+            "read bodies: {:?} {:?}",
+            self.req_body_file, self.res_body_file
+        );
+        let res_file_path = match &self.res_body_file {
+            Some(path) if path.ends_with(".enc.gz") => Some(path[..path.len() - 7].to_owned()),
+            Some(path) => Some(path.clone()),
+            None => None,
+        };
         tokio::join!(
             Body::read(&self.req_body_file, binary_in_base64),
-            Body::read(&self.res_body_file, binary_in_base64)
+            Body::read(&res_file_path, binary_in_base64)
         )
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrafficHead {
-    pub id: usize,
+    pub id: u64,
     pub method: String,
     pub uri: String,
     pub status: Option<u16>,
