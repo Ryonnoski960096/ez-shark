@@ -153,7 +153,7 @@ import InfoContent from "@/components/layout/main/infoPanel/index.vue";
 import Tabs from "@/components/tabs/index.vue";
 import Splitter from "@/components/Splitter.vue";
 import type { Ref } from "vue";
-import { nextTick, onMounted, ref, useTemplateRef, watch } from "vue";
+import { nextTick, onMounted, ref, useTemplateRef } from "vue";
 import { useEventBus } from "@/hooks";
 import type { Overview } from "@/stores/traffic";
 import { useTrafficStore } from "@/stores/traffic";
@@ -169,7 +169,7 @@ import Json from "@/components/contents/json.vue";
 import EditTable from "@/components/EditTable.vue";
 import Text from "@/components/contents/text.vue";
 import Panel from "@/components/Panel.vue";
-import { useIntervalFn } from "@vueuse/core";
+// import { useIntervalFn } from "@vueuse/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type { ActiveTraffic } from "@/utils/eventBus";
 import { deepClone, isValidBase64, waitForCondition } from "@/utils/tools";
@@ -177,28 +177,35 @@ import JsonEditorVue from "json-editor-vue";
 import { processCookies } from "@/utils/format";
 import { useSessionStore } from "@/stores/session";
 import Image from "@/components/contents/image.vue";
+import { watchDebounced } from "@vueuse/core";
 
 const value = ref("");
 const trafficStore = useTrafficStore();
 const sessionStore = useSessionStore();
 
-const { pause, resume, isActive } = useIntervalFn(
+watchDebounced(
+  [
+    () => trafficStore.trafficList,
+    () => sessionStore.currentSession,
+    () => value.value
+  ],
   () => {
+    if (value.value.length === 0) {
+      trafficStore.clearSearch();
+      trafficStore.isSearchMode = false;
+      return;
+    }
+    // console.log('debounced search')
+    trafficStore.isSearchMode = true;
     trafficStore.searchTraffic(value.value);
   },
-  500,
-  { immediate: false }
-);
-
-watch(value, (newValue) => {
-  if (newValue.length === 0) {
-    trafficStore.clearSearch();
-    if (isActive.value) pause();
-  } else {
-    if (!isActive.value) resume();
+  {
+    debounce: 300, // 防抖时长（毫秒）
+    maxWait: 1000, // 可选，最大等待时间
+    deep: 3, // 深度监听
+    immediate: false // 可选，是否立即执行一次
   }
-});
-
+);
 enum Mode {
   text = "text",
   tree = "tree",
@@ -461,6 +468,7 @@ win.listen<ActiveTraffic>("activeTraffic", async (event) => {
     isUpdated.value = false;
   }
   trafficStore.currentTrafficId.set(sessionStore.currentSession, trafficId);
+  // console.log("activeTraffic", activeTraffic);
 
   await waitForCondition(() => isUpdated.value);
   await nextTick();
@@ -476,9 +484,11 @@ win.listen<ActiveTraffic>("activeTraffic", async (event) => {
     case "Header":
       if (method === "request") {
         requestTab.value = "Header";
+        // console.log("reqHeaderRef", reqHeaderRef.value);
         await reqHeaderRef.value?.highlight(activeTraffic);
       } else {
         responseTab.value = "Header";
+        // console.log("resHeaderRef", resHeaderRef.value);
         await resHeaderRef.value?.highlight(activeTraffic);
       }
 
@@ -489,11 +499,13 @@ win.listen<ActiveTraffic>("activeTraffic", async (event) => {
 
         await waitForCondition(() => !!reqTextRef.value);
 
+        // console.log("reqBodyRef");
         reqTextRef.value?.highlight(activeTraffic);
       } else {
         responseTab.value = "Text";
 
         await waitForCondition(() => !!resTextRef.value);
+        // console.log("resBodyRef");
         resTextRef.value?.highlight(activeTraffic);
       }
       break;

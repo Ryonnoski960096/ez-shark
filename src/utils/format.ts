@@ -1,6 +1,6 @@
 import type { DataItem } from "@/components/contents/model";
 import type { IHeaders } from "@/stores/traffic";
-import { error } from "@tauri-apps/plugin-log";
+// import { error } from "@tauri-apps/plugin-log";
 import type { HttpRequestHeader } from "ant-design-vue/es/upload/interface";
 
 export interface FileSizeOptions {
@@ -128,8 +128,8 @@ export const parseUrlToHostPath = (
       // 将 pathname、search 和 hash 组合成完整的路径
       path = parsedUrl.pathname + parsedUrl.search + parsedUrl.hash;
     }
-  } catch (e) {
-    error(`Error parsing URL: ${e}`);
+  } catch {
+    // error(`Error parsing URL: ${e}`);
 
     // 如果解析失败，尝试作为 CONNECT 地址处理
     if (url.includes(":")) {

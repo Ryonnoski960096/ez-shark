@@ -8,6 +8,7 @@ import type { Payload } from "@/api/model";
 import type { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { error } from "@tauri-apps/plugin-log";
 import { useSessionStore } from "./session";
+import { ezSearch } from "@/api/search";
 
 export enum TransactionState {
   Pending = "Pending", // 初始化/等待发送
@@ -168,15 +169,28 @@ export const useTrafficStore = defineStore("traffic", () => {
   const isAutoScroll = ref<boolean>(false);
 
   // 搜索流量数据的方法
-  const searchTraffic = (keyword: string) => {
-    searchMode.value.clear();
+  const searchTraffic = async (keyword: string) => {
+    if (!sessionStore.currentSession) return;
+    const hasSearchModeTraffics = searchMode.value.has(
+      sessionStore.currentSession
+    );
+    // console.log("searchMode.value", searchMode.value);
+
+    if (!hasSearchModeTraffics) {
+      searchMode.value.set(sessionStore.currentSession, new Map());
+    }
+
+    const searchModeTraffics = searchMode.value.get(
+      sessionStore.currentSession
+    );
+    if (!searchModeTraffics) return;
     // 如果关键词为空，退出搜索模式
     if (!keyword.trim()) {
       isSearchMode.value = false;
       return;
     }
     // 设置搜索模式为true
-    isSearchMode.value = true;
+    // isSearchMode.value = true;
 
     // 创建高亮方法
     const highlightText = (text: string, keyword: string): string => {
@@ -198,7 +212,8 @@ export const useTrafficStore = defineStore("traffic", () => {
       return highlightedText;
     };
 
-    if (!sessionStore.currentSession) return;
+    // console.log("searchTraffic", keyword);
+
     const hasTraffics = trafficList.value.has(sessionStore.currentSession);
     if (!hasTraffics) {
       trafficList.value.set(sessionStore.currentSession, new Map());
@@ -206,50 +221,47 @@ export const useTrafficStore = defineStore("traffic", () => {
     const traffics = trafficList.value.get(sessionStore.currentSession);
     if (!traffics) return;
     // 遍历trafficList进行搜索
-    traffics.forEach((traffic, id) => {
-      // 转换关键词为小写，方便不区分大小写搜索
-      const lowercaseKeyword = keyword.toLowerCase();
 
-      // 定义搜索字段
-      const searchFields = [
-        traffic.uri.toLowerCase(),
-        traffic.method.toLowerCase(),
-        traffic.mime.toLowerCase(),
-        String(traffic.status).toLowerCase()
-      ];
+    const ids = await ezSearch(keyword, sessionStore.currentSession);
+    // console.log("ids", ids, !ids);
+    if (ids.length === 0) {
+      searchModeTraffics.clear();
+      // console.log("searchModeTraffics", searchModeTraffics);
 
+      return;
+    }
+    for (const id of ids) {
+      const traffic = traffics.get(Number(id));
+      if (!traffic) continue;
       // 定义高亮字段
       const highlightedTraffic = { ...traffic };
+      // 如果匹配，添加到搜索结果并高亮
 
-      // 检查是否匹配任何字段
-      const isMatch = searchFields.some((field) =>
-        field.includes(lowercaseKeyword)
+      // 高亮处理
+      highlightedTraffic.uri = highlightText(traffic.uri, keyword);
+      highlightedTraffic.method = highlightText(traffic.method, keyword);
+      highlightedTraffic.mime = highlightText(traffic.mime, keyword);
+      highlightedTraffic.status = Number(
+        highlightText(String(traffic.status), keyword)
       );
 
-      // 如果匹配，添加到搜索结果并高亮
-      if (isMatch) {
-        // 高亮处理
-        highlightedTraffic.uri = highlightText(traffic.uri, keyword);
-        highlightedTraffic.method = highlightText(traffic.method, keyword);
-        highlightedTraffic.mime = highlightText(traffic.mime, keyword);
-        highlightedTraffic.status = Number(
-          highlightText(String(traffic.status), keyword)
-        );
-        if (!sessionStore.currentSession) return;
-
-        const hasSearchModeTraffics = searchMode.value.get(
-          sessionStore.currentSession
-        );
-        if (!hasSearchModeTraffics) {
-          searchMode.value.set(sessionStore.currentSession, new Map());
-        }
-        const searchModeTraffics = searchMode.value.get(
-          sessionStore.currentSession
-        );
-        if (!searchModeTraffics) return;
-        searchModeTraffics.set(id, highlightedTraffic);
+      const hasSearchModeTraffics = searchMode.value.get(
+        sessionStore.currentSession
+      );
+      if (!hasSearchModeTraffics) {
+        searchMode.value.set(sessionStore.currentSession, new Map());
       }
-    });
+
+      searchModeTraffics.set(id, highlightedTraffic);
+    }
+    // 循环searchModeTraffics，把不包含ids中的id的删掉
+    const idSet = new Set(ids);
+
+    for (const [id] of searchModeTraffics) {
+      if (!idSet.has(id)) {
+        searchModeTraffics.delete(id);
+      }
+    }
   };
 
   // 清除搜索
@@ -337,6 +349,7 @@ export const useTrafficStore = defineStore("traffic", () => {
         const sessionTraffic = trafficList.value.get(sessionId);
         if (!sessionTraffic) return;
         sessionTraffic.set(trafficId, traffic);
+        // console.log("newTrafficHandler", sessionTraffic.size);
       };
 
       const pauseTrafficHandler: PauseTrafficHandler = async (payload) => {
