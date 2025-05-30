@@ -19,13 +19,10 @@ use crate::{
 use anyhow::Result;
 
 use chrono::{Datelike, Local};
-
-use indexmap::IndexMap;
 use log::info;
 use models::ExternalProxy;
 use serde::Serialize;
 use state::{SearchResult, TrafficModification};
-
 use std::{
     fs,
     net::{IpAddr, SocketAddr},
@@ -332,77 +329,14 @@ async fn get_monitor_session_id(
     Err("Not found state".to_string())
 }
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-// #[tauri::command]
-//  async fn start_traffic_monitor(
-//     window: Window,
-//     proxy_server: State<'_, Arc<Mutex<ProxyServer>>>
-// ) -> Result<(), String> {
-//     let proxy_server = proxy_server.lock().await;
-//     if let Some(state) = proxy_server.get_state() {
-//         // 检查是否已经运行
-//         if state.monitor_running.load(Ordering::SeqCst) {
-//             return Ok(());  // 如果已经运行，直接返回
-//         }
-//         // 设置运行标志
-//         state.monitor_running.store(true, Ordering::SeqCst);
-//         // 订阅流量通知
-//         let mut rx = state.traffics_notifier.subscribe();
-//         let window = window.clone();
-//         let mut pause_rx = state.pause_notifier.subscribe();
-//         // 启动后台任务转发流量
-//         tauri::async_runtime::spawn(async move {
-//             loop {
-//                 tokio::select! {
-//                     // 处理普通流量消息
-//                     result = rx.recv() => {
-//                         match result {
-//                             Ok(traffic_head) => {
-//                                 if let Err(e) = window.emit("new-traffic", traffic_head) {
-//                                     eprintln!("Failed to emit traffic: {}", e);
-//                                 }
-//                             }
-//                             Err(e) => {
-//                                 eprintln!("Traffic channel error: {}", e);
-//                                 break;
-//                             }
-//                         }
-//                     }
-//                     // 处理暂停消息
-//                     result = pause_rx.recv() => {
-//                         match result {
-//                             Ok(traffic) => {
-//                                 if let Err(e) = window.emit("pause-traffic", traffic) {
-//                                     eprintln!("Failed to emit pause traffic: {}", e);
-//                                 }
-//                             }
-//                             Err(e) => {
-//                                 eprintln!("Pause channel error: {}", e);
-//                                 break;
-//                             }
-//                         }
-//                     }
-//                 }
-//             }
-//         });
-//         return Ok(());
-//     }
-//     Err("Not found state".to_string())
-
-// }
-
 #[tauri::command]
 async fn get_traffic_detail(
     proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
-    session_id: String,
-    id: usize,
+    id: u64,
 ) -> Result<TrafficDetail, String> {
     let proxy_server = proxy_server.lock().await;
     if let Some(state) = proxy_server.get_state() {
-        let traffic = state
-            .get_traffic(id, session_id)
-            .await
-            .map_err(|e| e.to_string())?;
+        let traffic = state.get_traffic(id).await.map_err(|e| e.to_string())?;
 
         let (req_body, res_body) = traffic.bodies(false).await;
 
@@ -492,14 +426,13 @@ async fn handle_export_traffic(
 #[tauri::command]
 async fn handle_copy_traffic(
     proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
-    id: usize,
+    id: u64,
     format: String,
-    session_id: String,
 ) -> Result<String, String> {
     let proxy_server = proxy_server.lock().await;
     if let Some(state) = proxy_server.get_state() {
         let (data, _) = state
-            .export_traffic(id, &format, session_id)
+            .export_traffic(id, &format)
             .await
             .map_err(|e| format!("Failed to copy traffic: {}", e))?;
 
@@ -529,6 +462,24 @@ async fn open_config_dir(
 }
 
 #[tauri::command]
+async fn delete_traffic(
+    proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
+    ids: Vec<u64>,
+) -> Result<String, String> {
+    let proxy_server = proxy_server.lock().await;
+    if let Some(state) = proxy_server.get_state() {
+        for id in ids {
+            state
+                .delete_traffic(id)
+                .await
+                .expect("delete traffic failed");
+        }
+        return Ok("Success".to_string());
+    }
+    Err("Not found state".to_string())
+}
+
+#[tauri::command]
 async fn import_session(
     proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
     session_id: String,
@@ -551,25 +502,25 @@ async fn import_session(
             .map_err(|e| format!("Failed to parse JSON: {}", e))?;
 
         let mut result_array = Vec::new();
-
-        // 获取session的写锁
-        let mut sessions = state.session.write().await;
-
-        // 确保会话存在
-        if !sessions.contains_key(&session_id) {
-            sessions.insert(session_id.clone(), Mutex::new(IndexMap::new()));
+        let mut to_remove: Vec<u64> = Vec::new();
+        for (id, traffic) in state.traffics.iter() {
+            if traffic.session_id == session_id {
+                to_remove.push(*id);
+            }
         }
-
-        // 获取指定会话的锁
-        let session_traffics = sessions.get(&session_id).unwrap();
-        let mut session_traffics_locked = session_traffics.lock().await;
+        for id in to_remove {
+            state
+                .delete_traffic(id)
+                .await
+                .expect("delete traffic failed");
+        }
 
         // 处理每个 Traffic 对象
         for mut traffic in traffic_array {
             traffic.valid = true;
-            let id = session_traffics_locked.len() + 1;
+            let id = state.traffics.entry_count() + 1;
             let head = traffic.head(id, session_id.to_string());
-            session_traffics_locked.insert(id, Arc::new(traffic));
+            state.traffics.insert(id, Arc::new(traffic)).await;
             result_array.push(head);
         }
         return Ok(result_array);
@@ -723,7 +674,7 @@ async fn get_log_path(app_handle: tauri::AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 async fn resend(
-    id: usize,
+    id: u64,
     proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
 ) -> Result<String, String> {
     let proxy_server = proxy_server.lock().await;
@@ -777,22 +728,24 @@ async fn search(
 }
 
 #[tauri::command]
-async fn delete_traffic(
-    proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
+async fn ez_search(
+    keyword: String,
     session_id: String,
-    ids: Vec<usize>,
-) -> Result<String, String> {
+    proxy_server: State<'_, Arc<Mutex<ProxyServer>>>,
+) -> Result<Vec<String>, String> {
     let proxy_server = proxy_server.lock().await;
     if let Some(state) = proxy_server.get_state() {
-        for id in ids {
-            state
-                .delete_traffic(id, &session_id)
-                .await
-                .expect("delete traffic failed");
+        match state.ez_search_traffic(&keyword, &session_id).await {
+            Ok(search_result) => {
+                return Ok(search_result);
+            }
+            Err(_) => {
+                return Err("Search traffic failed".to_string());
+            }
         }
-        return Ok("Success".to_string());
+    } else {
+        Err("Not found state".to_string())
     }
-    Err("Not found state".to_string())
 }
 
 #[tauri::command]
@@ -888,6 +841,7 @@ pub fn run(ca: CertificateAuthority, config_dir: PathBuf) {
             resend,
             on_resend,
             search,
+            ez_search,
             delete_traffic,
             is_charles_running,
             kill_charles

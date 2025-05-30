@@ -15,12 +15,13 @@ use hyper_proxy2::{Intercept, Proxy, ProxyConnector};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use indexmap::IndexMap;
 use log::{debug, error};
+use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::{
     collections::HashMap,
@@ -34,7 +35,6 @@ use uuid::Uuid;
 
 use base64::Engine;
 use std::io::Write;
-use tokio::sync::RwLock;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TrafficModification {
     pub id: String, // 对应被暂停的流量 ID
@@ -119,7 +119,7 @@ pub struct SearchItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchData {
-    pub id: usize,
+    pub id: u64,
     pub url: String,
     pub search_item: Vec<SearchItem>,
 }
@@ -130,11 +130,13 @@ pub struct SearchResult {
     pub search_data: Vec<SearchData>,
 }
 
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug)]
 pub struct State {
     print_mode: PrintMode,
-    pub session: RwLock<HashMap<String, Mutex<IndexMap<usize, Arc<Traffic>>>>>,
-    // pub traffics: Mutex<IndexMap<usize, Arc<Traffic>>>,
+    // pub session: RwLock<HashMap<String, Mutex<IndexMap<usize, Arc<Traffic>>>>>,
+    pub traffics: Cache<u64, Arc<Traffic>>,
     pub traffics_notifier: broadcast::Sender<TrafficHead>,
     pub monitor_running: AtomicBool,
     // 添加断点相关字段
@@ -151,8 +153,8 @@ impl State {
         let (pause_notifier, _) = broadcast::channel(32);
         Self {
             print_mode,
-            // traffics: Default::default(),
-            session: Default::default(),
+            traffics: Cache::builder().max_capacity(10_000).build(),
+            // session: Default::default(),
             traffics_notifier,
             monitor_running: AtomicBool::new(false),
             paused_traffic: Mutex::new(HashMap::new()),
@@ -190,33 +192,41 @@ impl State {
         current_session
     }
 
+    pub async fn ez_search_traffic(
+        &self,
+        key_word: &String,
+        session_id: &String,
+    ) -> Result<Vec<String>, anyhow::Error> {
+        let mut results: Vec<String> = Vec::new();
+        // debug!("search_traffic: {:#?}", data);
+        if session_id.trim().is_empty() {
+            return Ok(results);
+        }
+        let keyword = key_word.to_string().to_lowercase();
+
+        for (id, traffic) in self.traffics.iter() {
+            if traffic.session_id != session_id.to_string() {
+                continue;
+            }
+            let traffic_clone = traffic;
+            let uri = traffic_clone.uri.to_lowercase();
+
+            if uri.contains(&keyword) {
+                results.push(id.to_string());
+            }
+        }
+        return Ok(results);
+    }
+
     pub async fn search_traffic(
         &self,
         data: SearchQuery,
         session_id: String,
     ) -> Result<Vec<SearchData>, anyhow::Error> {
         let mut results: Vec<SearchData> = Vec::new();
-
+        debug!("search_traffic: {:#?}", data);
         if session_id.trim().is_empty() {
             return Ok(results);
-        }
-
-        // 获取session的读锁
-        let sessions = self.session.read().await;
-
-        // 检查会话是否存在
-        let session_traffics = match sessions.get(&session_id) {
-            Some(traffics) => traffics,
-            None => {
-                return Ok(results);
-            }
-        };
-
-        // 如果 session_traffics 为空
-        {
-            if session_traffics.lock().await.is_empty() {
-                return Ok(results);
-            }
         }
 
         if data.text.is_empty() {
@@ -234,23 +244,24 @@ impl State {
                 .collect()
         };
 
-        // 获取会话流量的锁
-        let session_traffics_locked = session_traffics.lock().await;
-
-        for (id, traffic) in session_traffics_locked.iter() {
+        for (id, traffic) in self.traffics.iter() {
+            if traffic.session_id != session_id {
+                continue;
+            }
             let mut search_item: Vec<SearchItem> = Vec::new();
-
             // 检查请求URL
             if data.position.request_url {
                 let mut byte_index_list: Vec<usize> = Vec::new();
                 for byte_index in text_matches_all(&traffic.uri) {
                     byte_index_list.push(byte_index);
                 }
-                search_item.push(SearchItem {
-                    position: "Request URL".to_string(),
-                    content: traffic.uri.clone(),
-                    keyword_byte_index: byte_index_list,
-                });
+                if !byte_index_list.is_empty() {
+                    search_item.push(SearchItem {
+                        position: "Request URL".to_string(),
+                        content: traffic.uri.clone(),
+                        keyword_byte_index: byte_index_list,
+                    });
+                }
             }
 
             // 检查请求头
@@ -266,11 +277,13 @@ impl State {
                         for byte_index in text_matches_all(&headers_json) {
                             byte_index_list.push(byte_index);
                         }
-                        search_item.push(SearchItem {
-                            position: "Request Header".to_string(),
-                            content: headers_json,
-                            keyword_byte_index: byte_index_list,
-                        });
+                        if !byte_index_list.is_empty() {
+                            search_item.push(SearchItem {
+                                position: "Request Header".to_string(),
+                                content: headers_json,
+                                keyword_byte_index: byte_index_list,
+                            });
+                        }
                     }
                 }
             }
@@ -287,11 +300,13 @@ impl State {
                         for byte_index in text_matches_all(&headers_json) {
                             byte_index_list.push(byte_index);
                         }
-                        search_item.push(SearchItem {
-                            position: "Response Header".to_string(),
-                            content: headers_json,
-                            keyword_byte_index: byte_index_list,
-                        });
+                        if !byte_index_list.is_empty() {
+                            search_item.push(SearchItem {
+                                position: "Response Header".to_string(),
+                                content: headers_json,
+                                keyword_byte_index: byte_index_list,
+                            });
+                        }
                     }
                 }
             }
@@ -305,11 +320,13 @@ impl State {
                     for byte_index in text_matches_all(&body.value) {
                         byte_index_list.push(byte_index);
                     }
-                    search_item.push(SearchItem {
-                        position: "Request Body".to_string(),
-                        content: body.value,
-                        keyword_byte_index: byte_index_list,
-                    });
+                    if !byte_index_list.is_empty() {
+                        search_item.push(SearchItem {
+                            position: "Request Body".to_string(),
+                            content: body.value,
+                            keyword_byte_index: byte_index_list,
+                        });
+                    }
                 }
             }
 
@@ -320,11 +337,13 @@ impl State {
                     for byte_index in text_matches_all(&body.value) {
                         byte_index_list.push(byte_index);
                     }
-                    search_item.push(SearchItem {
-                        position: "Response Body".to_string(),
-                        content: body.value,
-                        keyword_byte_index: byte_index_list,
-                    });
+                    if !byte_index_list.is_empty() {
+                        search_item.push(SearchItem {
+                            position: "Response Body".to_string(),
+                            content: body.value,
+                            keyword_byte_index: byte_index_list,
+                        });
+                    }
                 }
             }
 
@@ -339,23 +358,15 @@ impl State {
 
         Ok(results)
     }
-    pub async fn resend_traffic(&self, id: usize) -> Result<(), anyhow::Error> {
-        let current_session = self.get_current_session();
-
-        // 获取 session 的读锁
-        let sessions = self.session.read().await;
-
-        // 尝试获取当前会话，如果不存在则返回错误
-        let session_traffics = sessions
-            .get(&current_session)
-            .ok_or_else(|| anyhow::anyhow!("Session {} not found", current_session))?;
-
+    pub async fn resend_traffic(&self, id: u64) -> Result<(), anyhow::Error> {
         let uu_id = Uuid::new_v4().to_string();
 
         // 获取指定 ID 的流量
-        let session_traffics_locked = session_traffics.lock().await;
-        let traffic: &Arc<Traffic> = session_traffics_locked
+
+        let traffic: Arc<Traffic> = self
+            .traffics
             .get(&id)
+            .await
             .ok_or_else(|| anyhow::anyhow!("Traffic with id {} not found", id))?;
 
         let (req_body, _) = traffic.bodies(false).await;
@@ -471,24 +482,12 @@ impl State {
     // 迁移数据
     pub async fn migrate_from(&self, other_state: &Arc<State>) {
         // 获取对旧结构中 session 的读锁
-        let other_sessions = other_state.session.read().await;
+        let other_traffics = &other_state.traffics;
 
-        // 获取对当前 session 的写锁
-        let mut current_sessions = self.session.write().await;
-
-        // 遍历旧结构中的所有会话
-        for (session_id, other_traffic_mutex) in &*other_sessions {
-            // 获取旧会话中每个 IndexMap 的锁
-            let other_traffic_map = other_traffic_mutex.lock().await;
-
-            // 创建一个新的 Mutex<IndexMap> 并复制数据
-            let traffic_mutex = Mutex::new(other_traffic_map.clone());
-
-            // 插入到当前 State 的 session 中
-            current_sessions.insert(session_id.clone(), traffic_mutex);
+        // 遍历旧结构中的所有流量
+        for (key, other_traffic) in other_traffics {
+            self.traffics.insert(*key, other_traffic).await;
         }
-
-        // 写锁在这里自动释放
     }
 
     // 检查流量是否匹配断点
@@ -631,7 +630,7 @@ impl State {
     pub async fn create_traffic_head(
         &self,
         traffic: &Traffic,
-        id: usize,
+        id: u64,
         session_id: String,
     ) -> Result<TrafficHead, String> {
         if !traffic.valid {
@@ -650,70 +649,24 @@ impl State {
         session_id: &String,
     ) -> Result<TrafficHead, String> {
         // 创建head
-        let id;
-        {
-            // 获取对session的读锁来确定ID
-            let sessions = self.session.read().await;
-            if !sessions.contains_key(session_id) {
-                // 如果会话不存在，ID为1
-                id = 1;
-            } else {
-                // 如果会话存在，获取当前长度+1
-                let session_traffics = sessions.get(session_id).unwrap();
-                let session_traffics_locked = session_traffics.lock().await;
-                id = session_traffics_locked.len() + 1;
-            }
-            // 读锁在这里释放
-        }
+        let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
 
         // 创建traffic head
         let head = self
             .create_traffic_head(&traffic, id, session_id.to_string())
             .await?;
-
-        // 插入流量
-        {
-            let mut sessions = self.session.write().await;
-
-            // 确保会话存在
-            if !sessions.contains_key(session_id) {
-                sessions.insert(session_id.to_string(), Mutex::new(IndexMap::new()));
-            }
-
-            // 获取会话的Mutex并插入流量
-            let session_traffics = sessions.get(session_id).unwrap();
-            let mut session_traffics_locked = session_traffics.lock().await;
-            session_traffics_locked.insert(id, traffic);
-            // 写锁在这里释放
-        }
+        self.traffics.insert(id, traffic).await;
 
         Ok(head)
     }
 
     // 删除流量
-    pub async fn delete_traffic(
-        &self,
-        id: usize,
-        session_id: &String,
-    ) -> Result<(), anyhow::Error> {
-        // 获取session的写锁
-        let sessions = self.session.write().await;
-
-        // 检查会话是否存在
-        let session_traffics = sessions
-            .get(session_id)
-            .ok_or_else(|| anyhow::anyhow!("Session {} not found", session_id))?;
-
-        // 获取会话流量的锁并删除指定ID的流量
-        let mut session_traffics_locked = session_traffics.lock().await;
-
-        // 如果流量存在，删除它
-        if session_traffics_locked.contains_key(&id) {
-            session_traffics_locked.swap_remove(&id);
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Traffic with id {} not found", id))
+    pub async fn delete_traffic(&self, id: u64) -> Result<(), anyhow::Error> {
+        let traffic = self.traffics.remove(&id).await;
+        if traffic.is_none() {
+            return Err(anyhow::anyhow!("Traffic not found"));
         }
+        Ok(())
     }
 
     // 继续执行被暂停的流量
@@ -829,66 +782,28 @@ impl State {
         }
     }
 
-    pub async fn done_traffic(&self, head_id: usize, raw_size: u64) {
+    pub async fn done_traffic(&self, head_id: u64, raw_size: u64) {
         let current_session = self.get_current_session();
-
-        // 获取session的写锁
-        let sessions = self.session.read().await;
-
-        // 获取当前会话
-        let session_traffics = match sessions.get(&current_session) {
-            Some(st) => st,
+        let Some(traffic) = self.traffics.get(&head_id).await else {
+            error!("流量不存在");
+            return;
+        };
+        let mut traffic_clone = Traffic::clone(&traffic);
+        // 设置事务状态
+        match traffic.status {
+            Some(status) => {
+                if status >= 400 {
+                    traffic_clone.set_transaction_state(traffic::TransactionState::Failed);
+                } else {
+                    traffic_clone.set_transaction_state(traffic::TransactionState::Completed);
+                }
+            }
             None => {
-                error!("Session {} not found", current_session);
-                return;
+                traffic_clone.set_transaction_state(traffic::TransactionState::Failed);
             }
-        };
-
-        // 创建一个作用域来持有锁
-        {
-            // 获取锁并保存在变量中
-            let mut session_traffics_locked = session_traffics.lock().await;
-            let traffic = match session_traffics_locked.get_mut(&head_id) {
-                Some(t) => t,
-                None => {
-                    error!("Traffic with id {} not found", head_id);
-                    return;
-                }
-            };
-
-            // 获取一次可变引用，避免多次调用 Arc::get_mut
-            if let Some(traffic_mut) = Arc::get_mut(traffic) {
-                // 设置事务状态
-                match traffic_mut.status {
-                    Some(status) => {
-                        if status >= 400 {
-                            traffic_mut.set_transaction_state(traffic::TransactionState::Failed);
-                        } else {
-                            traffic_mut.set_transaction_state(traffic::TransactionState::Completed);
-                        }
-                    }
-                    None => {
-                        traffic_mut.set_transaction_state(traffic::TransactionState::Failed);
-                    }
-                }
-
-                // 执行其他操作
-                traffic_mut.uncompress_res_file().await;
-                traffic_mut.done_res_body(raw_size);
-            }
-        } // session_traffics_locked 在这里被释放
-
-        // 获取一个克隆的 Arc<Traffic> 用于后续操作
-        let traffic_clone = {
-            let session_traffics_locked = session_traffics.lock().await;
-            match session_traffics_locked.get(&head_id) {
-                Some(t) => t.clone(),
-                None => {
-                    error!("Traffic with id {} not found after modification", head_id);
-                    return;
-                }
-            }
-        };
+        }
+        traffic_clone.uncompress_res_file().await;
+        traffic_clone.done_res_body(raw_size);
 
         if let Err(e) = self
             .create_traffic_head(&traffic_clone, head_id, current_session)
@@ -909,22 +824,12 @@ impl State {
         }
     }
 
-    pub async fn get_traffic(&self, id: usize, session_id: String) -> Result<Arc<Traffic>> {
-        // 获取session的读锁
-        let sessions = self.session.read().await;
-
-        // 检查会话是否存在
-        let session_traffics = sessions
-            .get(session_id.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Session {} not found", session_id))?;
-
-        // 获取会话流量的锁并查找指定ID的流量
-        let session_traffics_locked = session_traffics.lock().await;
-
-        // 克隆并返回找到的流量，如果不存在则返回错误
-        session_traffics_locked.get(&id).cloned().ok_or_else(|| {
-            anyhow::anyhow!("Traffic with id {} not found in session {}", id, session_id)
-        })
+    pub async fn get_traffic(&self, id: u64) -> Result<Arc<Traffic>> {
+        Ok(self
+            .traffics
+            .get(&id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Traffic with id {} not found", id))?)
     }
 
     pub fn subscribe_traffics(&self) -> broadcast::Receiver<TrafficHead> {
@@ -934,32 +839,17 @@ impl State {
     pub async fn list_heads(&self) -> Result<Vec<TrafficHead>> {
         let current_session = self.get_current_session();
 
-        // 获取session的读锁
-        let sessions = self.session.read().await;
-
-        // 检查当前会话是否存在
-        let session_traffics = sessions
-            .get(&current_session)
-            .ok_or_else(|| anyhow::anyhow!("Session {} not found", current_session))?;
-
-        // 获取会话流量的锁并收集所有流量头
-        let session_traffics_locked = session_traffics.lock().await;
-
         // 将每个流量转换为TrafficHead并收集到Vec中
-        Ok(session_traffics_locked
+        Ok(self
+            .traffics
             .iter()
             .map(|(id, traffic)| traffic.head(*id, current_session.clone()))
             .collect())
     }
 
-    pub async fn export_traffic(
-        &self,
-        id: usize,
-        format: &str,
-        session_id: String,
-    ) -> Result<(String, &'static str)> {
+    pub async fn export_traffic(&self, id: u64, format: &str) -> Result<(String, &'static str)> {
         let traffic = self
-            .get_traffic(id, session_id)
+            .get_traffic(id)
             .await
             .map_err(|_| anyhow!("Not found traffic {id}"))?;
         traffic.export(format).await
@@ -970,23 +860,14 @@ impl State {
         format: &str,
         session_id: String,
     ) -> Result<(String, &'static str)> {
-        // 获取session的读锁
-        let sessions = self.session.read().await;
-
-        // 检查会话是否存在
-        let session_traffics = sessions
-            .get(&session_id)
-            .ok_or_else(|| anyhow::anyhow!("Session {} not found", session_id))?;
-
         match format {
             "markdown" => {
-                let output = futures_util::future::join_all(
-                    session_traffics
-                        .lock()
-                        .await
-                        .iter()
-                        .map(|(_, v)| v.markdown()),
-                )
+                let output = futures_util::future::join_all(self.traffics.iter().map(
+                    |(_, traffic)| async move {
+                        // 使用 async move 和 to_string() 解决生命周期问题
+                        traffic.markdown().await.to_string()
+                    },
+                ))
                 .await
                 .into_iter()
                 .collect::<Vec<String>>()
@@ -995,11 +876,9 @@ impl State {
             }
             "har" => {
                 let values: Vec<Value> = futures_util::future::join_all(
-                    session_traffics
-                        .lock()
-                        .await
+                    self.traffics
                         .iter()
-                        .map(|(_, v)| v.har_entry()),
+                        .map(|(_, traffic)| async move { traffic.har_entry().await }),
                 )
                 .await
                 .into_iter()
@@ -1012,7 +891,9 @@ impl State {
             }
             "curl" => {
                 let output = futures_util::future::join_all(
-                    session_traffics.lock().await.iter().map(|(_, v)| v.curl()),
+                    self.traffics
+                        .iter()
+                        .map(|(_, traffic)| async move { traffic.curl().await }),
                 )
                 .await
                 .into_iter()
@@ -1022,7 +903,9 @@ impl State {
             }
             "json" => {
                 let values = futures_util::future::join_all(
-                    session_traffics.lock().await.iter().map(|(_, v)| v.json()),
+                    self.traffics
+                        .iter()
+                        .map(|(_, traffic)| async move { traffic.json().await }),
                 )
                 .await
                 .into_iter()
@@ -1032,12 +915,10 @@ impl State {
                 Ok((output, "application/json; charset=UTF-8"))
             }
             "" => {
-                let current_session = self.get_current_session();
-                let values = session_traffics
-                    .lock()
-                    .await
+                let values = self
+                    .traffics
                     .iter()
-                    .map(|(id, traffic)| traffic.head(*id, current_session.clone()))
+                    .map(|(id, traffic)| traffic.head(*id, session_id.clone()))
                     .collect::<Vec<TrafficHead>>();
                 let output = serde_json::to_string_pretty(&values)
                     .map_err(|e| anyhow::anyhow!("Failed to serialize TrafficHead JSON: {}", e))?;
@@ -1048,24 +929,13 @@ impl State {
     }
 
     pub async fn import_har(
-        &self, // 改为&self，因为使用RwLock提供内部可变性
+        &self,
         har_json: serde_json::Value,
         server: &Arc<Server>,
         session_id: String,
     ) -> Result<Vec<TrafficHead>, String> {
         if let Some(entries) = har_json["log"]["entries"].as_array() {
             let mut result_array = Vec::new();
-
-            // 获取session的写锁
-            let mut sessions = self.session.write().await;
-
-            // 确保会话存在
-            if !sessions.contains_key(&session_id) {
-                sessions.insert(session_id.clone(), Mutex::new(IndexMap::new()));
-            }
-
-            // 获取会话的Mutex
-            let session_traffics = sessions.get(&session_id).unwrap();
 
             for (gid, entry) in entries.iter().enumerate() {
                 // 处理请求头
@@ -1162,7 +1032,8 @@ impl State {
 
                 // 构建Traffic对象
                 let mut traffic = Traffic {
-                    gid,
+                    gid: gid as u64,
+                    session_id: session_id.clone(),
                     uri,
                     method: entry["request"]["method"]
                         .as_str()
@@ -1225,14 +1096,11 @@ impl State {
                     }
                 }
 
-                // 处理每个 Traffic 对象
                 traffic.valid = true;
 
-                // 获取会话流量的锁
-                let mut session_traffics_locked = session_traffics.lock().await;
-                let id = session_traffics_locked.len() + 1;
+                let id: u64 = self.traffics.entry_count() + 1;
                 let head = traffic.head(id, session_id.to_string());
-                session_traffics_locked.insert(id, Arc::new(traffic));
+                self.traffics.insert(id, Arc::new(traffic)).await;
                 result_array.push(head);
             }
 

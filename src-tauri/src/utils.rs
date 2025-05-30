@@ -7,11 +7,13 @@ use log::debug;
 use serde::de::Error;
 use serde::Serialize;
 use serde::{Deserialize, Deserializer, Serializer};
+use std::io::SeekFrom;
 use std::sync::{Arc, LazyLock};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tokio::io::AsyncSeekExt;
 use tokio::{
     fs::{self, File, OpenOptions},
-    io::{AsyncRead, AsyncReadExt, BufReader, BufWriter},
+    io::{AsyncRead, AsyncReadExt, AsyncSeek, BufReader, BufWriter},
 };
 use unicode_width::UnicodeWidthStr;
 // 1
@@ -330,14 +332,31 @@ mod tests {
 pub enum ProtobufError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
     #[error("UTF-8 error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
+
     #[error("Unknown wire type: {0}")]
     UnknownWireType(u64),
+
     #[error("Parse error: {0}")]
     Parse(String),
-}
 
+    #[error("Too many consecutive errors")]
+    TooManyErrors,
+
+    #[error("Field size too large: {0} bytes")]
+    FieldTooLarge(u64),
+
+    #[error("End of stream")]
+    EndOfStream,
+
+    #[error("Failed to recover from parsing errors")]
+    RecoveryFailed,
+
+    #[error("Parse timeout")]
+    ParseTimeout,
+}
 // Protobuf 值类型
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
@@ -362,12 +381,15 @@ where
 }
 
 // Protobuf 解析器
-pub struct ProtobufUnknownParser<R> {
+pub struct ProtobufUnknownParser<R>
+where
+    R: AsyncRead + AsyncSeek + Unpin,
+{
     data: R,
     result: HashMap<u32, Value>,
 }
 
-impl<R: AsyncRead + Unpin> ProtobufUnknownParser<R> {
+impl<R: AsyncRead + AsyncSeek + Unpin> ProtobufUnknownParser<R> {
     pub fn new(reader: R) -> Self {
         Self {
             data: reader,
@@ -420,51 +442,207 @@ impl<R: AsyncRead + Unpin> ProtobufUnknownParser<R> {
     fn is_valid_utf8(data: &[u8]) -> bool {
         String::from_utf8(data.to_vec()).is_ok()
     }
+    pub async fn parse(&mut self) -> &HashMap<u32, Value> {
+        let mut error_count = 0;
+        const MAX_ERRORS: usize = 10; // 设置一个最大连续错误数
+        const MAX_FIELDS: usize = 100000; // 设置一个最大字段数限制
 
-    pub async fn parse(&mut self) -> Result<&HashMap<u32, Value>, ProtobufError> {
+        let mut field_count = 0;
+
         loop {
+            if field_count > MAX_FIELDS {
+                debug!("Reached maximum field count: {}", MAX_FIELDS);
+                break;
+            }
+            field_count += 1;
+
             match self.parse_field().await {
-                Ok(true) => continue,
-                Ok(false) => break,
+                Ok(true) => {
+                    error_count = 0; // 重置错误计数
+                    continue;
+                }
+                Ok(false) => break, // 正常结束
                 Err(e) => {
                     debug!("Error parsing field: {}", e);
-                    if self.data.read_u8().await.is_err() {
-                        break;
+                    error_count += 1;
+
+                    // 如果连续错误过多，可能是数据彻底损坏，直接退出
+                    if error_count > MAX_ERRORS {
+                        debug!(
+                            "Too many consecutive errors ({}), stopping parsing",
+                            MAX_ERRORS
+                        );
+                        break; // 不返回错误，只是停止解析
+                    }
+
+                    // 尝试查找下一个可能的字段开始位置
+                    match self.skip_to_next_field().await {
+                        Ok(_) => continue, // 找到了可能的下一个字段，继续解析
+                        Err(_) => break,   // 无法找到下一个字段，停止解析但不返回错误
                     }
                 }
             }
         }
-        Ok(&self.result)
+
+        debug!(
+            "Parsed {} fields, result contains {} entries",
+            field_count,
+            self.result.len()
+        );
+        &self.result
+    }
+
+    // 新增方法，尝试跳过当前损坏的字段
+    async fn skip_to_next_field(&mut self) -> Result<(), ProtobufError> {
+        // 最多跳过1KB以找到下一个可能的有效字段
+        const MAX_SKIP_BYTES: usize = 1024;
+
+        let mut skipped = 0;
+        while skipped < MAX_SKIP_BYTES {
+            // 尝试读取一个字节
+            let byte = match self.data.read_u8().await {
+                Ok(b) => b,
+                Err(_) => return Err(ProtobufError::EndOfStream),
+            };
+
+            skipped += 1;
+
+            // 检查是否可能是一个新字段的开始
+            let wire_type = byte & 0x7;
+            if wire_type <= 5 {
+                // 有效的wire type范围是0-5
+                // 计算字段编号 (对于单字节的标记)
+                let field_number = byte >> 3;
+
+                // 对于单字节标记，字段编号范围检查
+                // 对于u8类型，只需确保field_number > 0即可
+                if field_number > 0 {
+                    // 找到了可能有效的字段标记
+                    self.data.seek(SeekFrom::Current(-1)).await?;
+                    debug!("Skipped {} bytes to find next valid field", skipped);
+                    return Ok(());
+                }
+            }
+        }
+
+        // 如果跳过了太多字节仍未找到有效字段，返回错误
+        debug!(
+            "Failed to find valid field after skipping {} bytes",
+            skipped
+        );
+        Err(ProtobufError::RecoveryFailed)
     }
 
     async fn parse_field(&mut self) -> Result<bool, ProtobufError> {
         let tag = match self.read_varint().await {
             Ok(t) => t,
-            Err(_) => return Ok(false),
+            Err(e) => {
+                if let ProtobufError::Io(ref io_err) = e {
+                    if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
+                        return Ok(false); // 正常结束
+                    }
+                }
+                return Err(e); // 其他错误
+            }
         };
 
         let wire_type = tag & 0x07;
         let field_number = (tag >> 3) as u32;
 
-        let value = match wire_type {
+        // 验证字段编号的合理性
+        if field_number == 0 || field_number >= 536870912 {
+            // 2^29
+            debug!(
+                "Invalid field number: {}, attempting to recover",
+                field_number
+            );
+            return self.skip_to_next_field().await.map(|_| true);
+        }
+
+        match wire_type {
             0 => {
-                let varint_value = self.read_varint().await?;
-                self.process_varint(varint_value)
-            }
-            1 => Value::Fixed64(self.read_double().await?),
-            2 => {
-                let length = self.read_varint().await? as usize;
-                let bytes = self.read_bytes(length).await?;
-                if Self::is_valid_utf8(&bytes) {
-                    Value::String(String::from_utf8(bytes)?)
-                } else {
-                    Value::LengthDelimited(bytes)
+                // varint
+                match self.read_varint().await {
+                    Ok(varint_value) => {
+                        let value = self.process_varint(varint_value);
+                        self.store_value(field_number, value);
+                    }
+                    Err(e) => {
+                        debug!("Error reading varint: {}, attempting to recover", e);
+                        return self.skip_to_next_field().await.map(|_| true);
+                    }
                 }
             }
-            5 => Value::Fixed32(self.read_float().await?),
-            _ => return Err(ProtobufError::UnknownWireType(wire_type)),
-        };
+            1 => {
+                // 64-bit
+                match self.read_double().await {
+                    Ok(value) => {
+                        self.store_value(field_number, Value::Fixed64(value));
+                    }
+                    Err(e) => {
+                        debug!("Error reading fixed64: {}, attempting to recover", e);
+                        return self.skip_to_next_field().await.map(|_| true);
+                    }
+                }
+            }
+            2 => {
+                // Length-delimited
+                match self.read_varint().await {
+                    Ok(length) => {
+                        // 安全检查: 限制长度
+                        const MAX_FIELD_SIZE: usize = 10 * 1024 * 1024; // 10MB
+                        let length = length as usize;
 
+                        if length > MAX_FIELD_SIZE {
+                            debug!("Field too large: {}bytes, attempting to recover", length);
+                            return self.skip_to_next_field().await.map(|_| true);
+                        }
+
+                        match self.read_bytes(length).await {
+                            Ok(bytes) => {
+                                let value = if Self::is_valid_utf8(&bytes) {
+                                    Value::String(String::from_utf8(bytes)?)
+                                } else {
+                                    Value::LengthDelimited(bytes)
+                                };
+                                self.store_value(field_number, value);
+                            }
+                            Err(e) => {
+                                debug!("Error reading bytes: {}, attempting to recover", e);
+                                return self.skip_to_next_field().await.map(|_| true);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!("Error reading length: {}, attempting to recover", e);
+                        return self.skip_to_next_field().await.map(|_| true);
+                    }
+                }
+            }
+            5 => {
+                // 32-bit
+                match self.read_float().await {
+                    Ok(value) => {
+                        self.store_value(field_number, Value::Fixed32(value));
+                    }
+                    Err(e) => {
+                        debug!("Error reading fixed32: {}, attempting to recover", e);
+                        return self.skip_to_next_field().await.map(|_| true);
+                    }
+                }
+            }
+            _ => {
+                // Unknown wire type
+                debug!("Unknown wire type: {}, attempting to recover", wire_type);
+                return self.skip_to_next_field().await.map(|_| true);
+            }
+        }
+
+        Ok(true)
+    }
+
+    // 辅助方法，用于存储值
+    fn store_value(&mut self, field_number: u32, value: Value) {
         match self.result.get_mut(&field_number) {
             Some(existing_value) => match existing_value {
                 Value::Array(vec) => vec.push(value),
@@ -479,8 +657,6 @@ impl<R: AsyncRead + Unpin> ProtobufUnknownParser<R> {
                 self.result.insert(field_number, value);
             }
         }
-
-        Ok(true)
     }
 
     pub fn analyze_structure(&self) {
@@ -522,10 +698,14 @@ impl<R: AsyncRead + Unpin> ProtobufUnknownParser<R> {
     }
 }
 
-pub async fn parse_unknown_protobuf(buffer: &[u8]) -> Result<HashMap<u32, Value>, ProtobufError> {
+pub async fn parse_unknown_protobuf(buffer: &[u8]) -> HashMap<u32, Value> {
     let cursor = Cursor::new(buffer);
     let mut parser = ProtobufUnknownParser::new(cursor);
-    Ok(parser.parse().await?.clone())
+
+    // 尝试解析，即使出错也返回已解析的部分
+    match parser.parse().await {
+        result => result.clone(),
+    }
 }
 
 /// 检查是否为本地请求  
